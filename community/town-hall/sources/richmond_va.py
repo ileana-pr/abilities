@@ -6,6 +6,9 @@ class RichmondCitySource(CivicSource):
     def get_name(self) -> str:
         return "Richmond City Council"
 
+    def get_source_url(self) -> str:
+        return "https://richmondva.legistar.com/Calendar.aspx"
+
     async def fetch_updates(self) -> str:
         url = "https://richmondva.legistar.com/Calendar.aspx"
         headers = {

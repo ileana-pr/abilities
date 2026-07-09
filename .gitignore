@@ -53,3 +53,6 @@ temp_interactive_push.bat
 
 # Fonts (generated/local)
 public/fonts/
+
+# Developer notes (local reference only, not for version control)
+_dev-notes/

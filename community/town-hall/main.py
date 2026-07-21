@@ -7,6 +7,9 @@ from src.agent.capability_worker import CapabilityWorker
 
 # Import the discovery helper
 from .sources import discover_sources
+from .sources.virginia_state import VirginiaStateSource
+
+LIS_API_KEY_NAME = "lis_api_key"
 
 class TownHallCapability(MatchingCapability):
     worker: AgentWorker = None
@@ -16,6 +19,19 @@ class TownHallCapability(MatchingCapability):
     SOURCES = discover_sources()
 
     #{{register capability}}
+
+    def _inject_lis_api_key(self):
+        """prefer openhome settings key; virginia source also falls back to LIS_API_KEY env."""
+        key = None
+        try:
+            key = self.capability_worker.get_api_keys(LIS_API_KEY_NAME)
+        except Exception:
+            key = None
+        if not key:
+            return
+        for source in self.SOURCES:
+            if isinstance(source, VirginiaStateSource):
+                source.set_api_key(key)
 
     async def log_gap(self, query: str, reason: str):
         """Logs queries the agent couldn't answer."""
@@ -41,6 +57,7 @@ class TownHallCapability(MatchingCapability):
         """Core coordinator that iterates through all sources."""
         while True:
             try:
+                self._inject_lis_api_key()
                 aggregated_updates = [f"# TownHall Civic Briefing\nGenerated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"]
                 
                 for source in self.SOURCES:
@@ -83,5 +100,6 @@ class TownHallCapability(MatchingCapability):
     def call(self, worker: AgentWorker):
         self.worker = worker
         self.capability_worker = CapabilityWorker(self.worker)
+        self._inject_lis_api_key()
         self.worker.session_tasks.create(self.watchdog_loop())
         self.worker.session_tasks.create(self.run())

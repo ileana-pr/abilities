@@ -1,20 +1,26 @@
-import os
+import csv
 import re
 from html import unescape
 from typing import Optional
 
-import requests
-
 from .base import CivicSource
 
 LIS_BASE = "https://lis.virginia.gov"
+CSV_BASE = "https://lis.blob.core.windows.net/lisfiles"
 TOPIC_QUERIES = ("housing", "education", "zoning")
 MAX_BILLS = 8
 REQUEST_TIMEOUT = 60
+# 2026 regular, then special, then 2025 regular
+SESSION_CANDIDATES = (
+    (20261, "2026 Regular Session"),
+    (20262, "2026 Special Session"),
+    (20251, "2025 Regular Session"),
+)
 
 
 class VirginiaStateSource(CivicSource):
     def __init__(self, api_key: Optional[str] = None):
+        super().__init__()
         self._api_key = api_key
 
     def set_api_key(self, api_key: Optional[str]) -> None:
@@ -29,8 +35,7 @@ class VirginiaStateSource(CivicSource):
     def _resolve_api_key(self) -> Optional[str]:
         if self._api_key:
             return self._api_key.strip() or None
-        env_key = os.getenv("LIS_API_KEY", "").strip()
-        return env_key or None
+        return None
 
     def _headers(self, api_key: str) -> dict:
         return {
@@ -40,54 +45,136 @@ class VirginiaStateSource(CivicSource):
             "User-Agent": "OpenHome-TownHall/1.0",
         }
 
-    def _get_active_session(self, api_key: str) -> tuple[int, str]:
-        """return (session_code_int, display_label). prefer active regular session."""
-        url = f"{LIS_BASE}/Session/api/getsessionlistasync"
-        resp = requests.get(url, headers=self._headers(api_key), timeout=REQUEST_TIMEOUT)
-        resp.raise_for_status()
-        sessions = resp.json().get("Sessions") or []
-        if not sessions:
-            return 20261, "2026 Regular Session"
-
-        def year_of(s: dict) -> int:
-            code = str(s.get("SessionCode") or "0")
-            return int(s.get("SessionYear") or code[:4] or 0)
-
-        def is_regular(s: dict) -> bool:
-            stype = str(s.get("SessionType") or "").lower()
-            code = str(s.get("SessionCode") or "")
-            return stype == "regular" or (code.endswith("1") and "special" not in stype)
-
-        def rank(s: dict) -> tuple:
-            # higher is better: active regular > default regular > active > default > year
-            return (
-                1 if (s.get("IsActive") and is_regular(s)) else 0,
-                1 if (s.get("IsDefault") and is_regular(s)) else 0,
-                1 if s.get("IsActive") else 0,
-                1 if s.get("IsDefault") else 0,
-                1 if is_regular(s) else 0,
-                year_of(s),
+    async def _fetch_bills_csv(self, session_code: int) -> list[dict]:
+        """public hourly CSV — no api key required. prefer a byte range for speed."""
+        url = f"{CSV_BASE}/{session_code}/BILLS.CSV"
+        # partial download keeps the voice session awake (full file is ~1.3MB)
+        resp = await self._http_get(
+            url,
+            headers={"Accept": "text/csv", "Range": "bytes=0-250000"},
+            timeout=REQUEST_TIMEOUT,
+        )
+        if resp.status_code >= 400 or not resp.text:
+            # fall back to full file
+            resp = await self._http_get(
+                url, headers={"Accept": "text/csv"}, timeout=REQUEST_TIMEOUT
             )
+        if resp.status_code >= 400 or not resp.text:
+            return []
+        text = resp.text
+        # strip utf-8 bom if present
+        if text.startswith("\ufeff"):
+            text = text[1:]
+        lines = text.splitlines()
+        # drop a possibly truncated final line from Range responses
+        if len(lines) > 2 and lines[-1].count('"') % 2 == 1:
+            lines = lines[:-1]
+        reader = csv.DictReader(lines)
+        bills: list[dict] = []
+        topic_hits = 0
+        for row in reader:
+            bill_id = (row.get("Bill_id") or row.get("Bill_ID") or "").strip()
+            if not bill_id:
+                continue
+            failed = (row.get("Failed") or "").strip().upper()
+            desc = (row.get("Bill_description") or row.get("Bill_Description") or "").strip()
+            patron = (row.get("Patron_name") or row.get("Patron_Name") or "").strip()
+            status = self._status_from_csv_row(row)
+            bill = {
+                "LegislationNumber": bill_id,
+                "FullNumber": bill_id,
+                "Description": desc,
+                "LegislationTitle": desc,
+                "LegislationStatus": status,
+                "LegislationTypeCode": "B" if bill_id.upper().startswith(("HB", "SB")) else "",
+                "Patrons": [{"Name": patron, "IsIntroducing": True}] if patron else [],
+                "_failed": failed == "Y",
+            }
+            bills.append(bill)
+            lower = desc.lower()
+            if any(topic in lower for topic in TOPIC_QUERIES):
+                topic_hits += 1
+            # enough for a voice briefing — stop scanning early
+            if topic_hits >= MAX_BILLS and len(bills) >= MAX_BILLS * 3:
+                break
+        return bills
 
-        chosen = max(sessions, key=rank)
-        code = str(chosen.get("SessionCode") or "20261")
-        year = chosen.get("SessionYear") or code[:4]
-        stype = chosen.get("SessionType") or "Regular"
-        label = f"{year} {stype} Session"
-        return int(code), label
+    @staticmethod
+    def _status_from_csv_row(row: dict) -> str:
+        if (row.get("Approved") or "").strip().upper() == "Y":
+            return "Approved"
+        if (row.get("Vetoed") or "").strip().upper() == "Y":
+            return "Vetoed"
+        if (row.get("Passed") or "").strip().upper() == "Y":
+            return "Passed"
+        if (row.get("Failed") or "").strip().upper() == "Y":
+            return "Failed"
+        if (row.get("Carried_over") or "").strip().upper() == "Y":
+            return "Carried Over"
+        house = (row.get("Last_house_action") or "").strip()
+        senate = (row.get("Last_senate_action") or "").strip()
+        if house:
+            return house
+        if senate:
+            return senate
+        return "In progress"
 
-    def _fetch_session_bills(self, api_key: str, session_code: int) -> list[dict]:
-        # session list endpoint is lighter than the full post search payload
-        url = (
+    async def _fetch_via_api(self, api_key: str) -> tuple[str, list[dict]]:
+        url = f"{LIS_BASE}/Session/api/getsessionlistasync"
+        resp = await self._http_get(url, headers=self._headers(api_key), timeout=REQUEST_TIMEOUT)
+        if resp.status_code >= 400:
+            raise RuntimeError(f"session list HTTP {resp.status_code}")
+        data = resp.json() or {}
+        sessions = data.get("Sessions") or []
+        session_code, label = 20261, "2026 Regular Session"
+        if sessions:
+            def year_of(s: dict) -> int:
+                code = str(s.get("SessionCode") or "0")
+                return int(s.get("SessionYear") or code[:4] or 0)
+
+            def is_regular(s: dict) -> bool:
+                stype = str(s.get("SessionType") or "").lower()
+                code = str(s.get("SessionCode") or "")
+                return stype == "regular" or (code.endswith("1") and "special" not in stype)
+
+            def rank(s: dict) -> tuple:
+                return (
+                    1 if (s.get("IsActive") and is_regular(s)) else 0,
+                    1 if (s.get("IsDefault") and is_regular(s)) else 0,
+                    1 if s.get("IsActive") else 0,
+                    1 if s.get("IsDefault") else 0,
+                    1 if is_regular(s) else 0,
+                    year_of(s),
+                )
+
+            chosen = max(sessions, key=rank)
+            code = str(chosen.get("SessionCode") or "20261")
+            year = chosen.get("SessionYear") or code[:4]
+            stype = chosen.get("SessionType") or "Regular"
+            session_code = int(code)
+            label = f"{year} {stype} Session"
+
+        list_url = (
             f"{LIS_BASE}/Legislation/api/getlegislationsessionlistasync"
             f"?SessionCode={session_code}"
         )
-        resp = requests.get(url, headers=self._headers(api_key), timeout=REQUEST_TIMEOUT)
-        if resp.status_code == 204 or not resp.content:
-            return []
-        resp.raise_for_status()
-        data = resp.json()
-        return data.get("Legislations") or data.get("ListItems") or []
+        resp = await self._http_get(
+            list_url, headers=self._headers(api_key), timeout=REQUEST_TIMEOUT
+        )
+        if resp.status_code == 204 or not resp.text:
+            return label, []
+        if resp.status_code >= 400:
+            raise RuntimeError(f"legislation list HTTP {resp.status_code}")
+        payload = resp.json() or {}
+        bills = payload.get("Legislations") or payload.get("ListItems") or []
+        return label, bills
+
+    async def _fetch_via_csv(self) -> tuple[str, list[dict]]:
+        for session_code, label in SESSION_CANDIDATES:
+            bills = await self._fetch_bills_csv(session_code)
+            if bills:
+                return label, bills
+        return "2026 Regular Session", []
 
     @staticmethod
     def _strip_html(text: str) -> str:
@@ -126,7 +213,6 @@ class VirginiaStateSource(CivicSource):
 
     @staticmethod
     def _is_bill(bill: dict) -> bool:
-        # prefer actual bills over commemorative resolutions when filling
         type_code = (bill.get("LegislationTypeCode") or "").upper()
         number = VirginiaStateSource._bill_number(bill).upper()
         if type_code == "B" or number.startswith(("HB", "SB")):
@@ -179,6 +265,8 @@ class VirginiaStateSource(CivicSource):
         seen: set[str] = set()
 
         for bill in bills:
+            if bill.get("_failed"):
+                continue
             status = (bill.get("LegislationStatus") or "").lower()
             if "fail" in status:
                 continue
@@ -198,31 +286,36 @@ class VirginiaStateSource(CivicSource):
         return selected
 
     async def fetch_updates(self) -> str:
-        api_key = self._resolve_api_key()
-        if not api_key:
-            return (
-                "### Virginia General Assembly\n"
-                "- **Error**: Missing LIS API key. Set `LIS_API_KEY` in the environment "
-                "or configure `lis_api_key` in OpenHome Settings → API Keys."
-            )
+        label = "2026 Regular Session"
+        bills: list[dict] = []
+        errors: list[str] = []
 
+        # public CSV first — works without custom auth headers in the sandbox http helper
         try:
-            session_code, session_label = self._get_active_session(api_key)
-            bills = self._fetch_session_bills(api_key, session_code)
-            selected = self._select_bills(bills)
+            label, bills = await self._fetch_via_csv()
+        except Exception as e:
+            errors.append(f"csv: {e}")
 
-            lines = [f"### Virginia General Assembly ({session_label})"]
-            if not selected:
-                lines.append("- No matching legislation found for current focus topics.")
-                lines.append(f"- Source: {self.get_source_url()}")
-                return "\n".join(lines)
+        # optional api enrichment if csv empty and key is present
+        if not bills:
+            api_key = self._resolve_api_key()
+            if api_key:
+                try:
+                    label, bills = await self._fetch_via_api(api_key)
+                except Exception as e:
+                    errors.append(f"api: {e}")
+            else:
+                errors.append("api: no lis_api_key available to ability runtime")
 
-            for bill in selected:
-                lines.append(self._format_bill_line(bill))
+        selected = self._select_bills(bills)
+        lines = [f"### Virginia General Assembly ({label})"]
+        if not selected:
+            lines.append("- No matching legislation found for current focus topics.")
+            if errors:
+                lines.append(f"- Note: fetch issues ({'; '.join(errors)})")
+            lines.append(f"- Source: {self.get_source_url()}")
             return "\n".join(lines)
 
-        except requests.HTTPError as e:
-            status = e.response.status_code if e.response is not None else "?"
-            return f"### Virginia General Assembly\n- **Error**: LIS API HTTP {status}: {e}"
-        except Exception as e:
-            return f"### Virginia General Assembly\n- **Error**: Failed to fetch LIS data: {e}"
+        for bill in selected:
+            lines.append(self._format_bill_line(bill))
+        return "\n".join(lines)

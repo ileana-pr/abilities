@@ -1,0 +1,13 @@
+{
+  "name": "townhall",
+  "capability_id": "7377",
+  "category": "skill",
+  "description": "townhall ability",
+  "trigger_words": [
+    "virginia town hall",
+    "richmond morning briefing"
+  ],
+  "release_id": 17254,
+  "version": "v4",
+  "is_committed": true
+}

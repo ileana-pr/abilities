@@ -10,9 +10,8 @@ A voice-activated civic briefing ability for OpenHome. Ask your agent what's hap
 
 | Phrase | What it does |
 | --- | --- |
-| `"town hall"` | starts the civic briefing flow |
-| `"morning briefing"` | starts the civic briefing flow |
-| `"city hall"` | starts the civic briefing flow |
+| `"virginia town hall"` | briefing focused on Virginia General Assembly activity |
+| `"richmond morning briefing"` | briefing focused on Richmond City Council meetings |
 
 ---
 
@@ -55,10 +54,8 @@ The ability logs `LIS_API_KEY resolved successfully` on startup if the key is fo
 
 ## Usage Examples
 
-- *"Hey OpenHome, town hall."*
-- *"Give me my morning briefing."*
-- *"What's happening at city hall?"*
-- *"What bills are moving in the General Assembly?"*
+- *"Hey OpenHome, virginia town hall."*
+- *"Richmond morning briefing."*
 
 ---
 

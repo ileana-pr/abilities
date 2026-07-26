@@ -7,15 +7,10 @@ from src.agent.capability_worker import CapabilityWorker
 from .sources import discover_sources
 from .sources.virginia_state import VirginiaStateSource
 
-LIS_API_KEY_ALIASES = (
-    "lis_api_key",
-    "LIS_API_KEY",
-    "lis-api-key",
-    "virginia_lis_api_key",
-)
+LIS_API_KEY_NAME = "LIS_API_KEY"
+
 BRIEFING_FILE = "townhall_briefing.md"
-
-
+ 
 class TownHallCapability(MatchingCapability):
     worker: AgentWorker = None
     capability_worker: CapabilityWorker = None
@@ -25,18 +20,18 @@ class TownHallCapability(MatchingCapability):
     #{{register capability}}
 
     def _resolve_lis_key(self) -> str | None:
-        for name in LIS_API_KEY_ALIASES:
-            try:
-                key = self.capability_worker.get_api_keys(name)
-            except Exception:
-                key = None
-            if key and str(key).strip():
-                self.worker.editor_logging_handler.info(
-                    f"LIS key resolved via get_api_keys('{name}')"
-                )
-                return str(key).strip()
+        try:
+            key = self.capability_worker.get_api_keys(LIS_API_KEY_NAME)
+        except Exception as e:
+            self.worker.editor_logging_handler.warning(
+                f"LIS key lookup raised an error: {e}"
+            )
+            return None
+        if key and str(key).strip():
+            self.worker.editor_logging_handler.info("LIS_API_KEY resolved successfully")
+            return str(key).strip()
         self.worker.editor_logging_handler.warning(
-            "LIS key not found. Settings third-party key must be named lis_api_key"
+            f"LIS key not found. Add a third-party key named '{LIS_API_KEY_NAME}' in Settings."
         )
         return None
 

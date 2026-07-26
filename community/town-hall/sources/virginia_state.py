@@ -122,6 +122,10 @@ class VirginiaStateSource(CivicSource):
     async def _fetch_via_api(self, api_key: str) -> tuple[str, list[dict]]:
         url = f"{LIS_BASE}/Session/api/getsessionlistasync"
         resp = await self._http_get(url, headers=self._headers(api_key), timeout=REQUEST_TIMEOUT)
+        if resp.status_code in (401, 403):
+            raise RuntimeError(
+                f"LIS API key rejected (HTTP {resp.status_code}) — verify LIS_API_KEY in Settings"
+            )
         if resp.status_code >= 400:
             raise RuntimeError(f"session list HTTP {resp.status_code}")
         data = resp.json() or {}
@@ -305,7 +309,7 @@ class VirginiaStateSource(CivicSource):
                 except Exception as e:
                     errors.append(f"api: {e}")
             else:
-                errors.append("api: no lis_api_key available to ability runtime")
+                errors.append("api: LIS_API_KEY not available to ability runtime")
 
         selected = self._select_bills(bills)
         lines = [f"### Virginia General Assembly ({label})"]

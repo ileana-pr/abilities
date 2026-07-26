@@ -1,26 +1,59 @@
-# 🏛️ TownHall: Your Personal Civic Watchdog
+# Town Hall — Civic Morning Briefing
 
-TownHall revolutionizes civic engagement by automatically monitoring local and state government activity and providing you with a concise, voice-activated morning briefing.
+A voice-activated civic watchdog for Richmond, VA and the Virginia General Assembly. Ask your agent for a morning briefing and get a spoken summary of upcoming City Council meetings and active state legislation, filtered for housing, education, and zoning topics.
 
-## Features
-- **Morning Briefing**: Get a summary of Richmond City Council agendas and Virginia General Assembly legislation.
-- **Civic Watchdog**: A background daemon that periodically scrapes official government portals (Legistar, LIS) to keep your agent's knowledge fresh.
-- **Engagement**: Draft professional emails to your representatives directly via voice.
-- **Gap Analysis**: Automatically tracks questions it couldn't answer, helping you identify what local data needs to be added next.
+## Trigger Words
+
+| Phrase | What it does |
+| --- | --- |
+| "town hall" | starts the briefing flow |
+| "morning briefing" | starts the briefing flow |
+| "city hall" | starts the briefing flow |
+
+## What It Does
+
+- **Morning briefing** — speaks a 4–6 sentence summary of upcoming Richmond City Council meetings and relevant Virginia General Assembly bills.
+- **Background refresh** — a watchdog loop warms the briefing cache on startup and refreshes it every hour so responses are instant.
+- **Cached context** — writes `townhall_briefing.md` into the agent's context so the briefing is always available even if live sources are slow.
+- **Gap logging** — logs unanswered civic questions to `knowledge_gaps.json` in the ability directory for future iteration.
+
+## Data Sources
+
+| Source | URL | Auth required |
+| --- | --- | --- |
+| Richmond City Council calendar | `richmondva.legistar.com` | none |
+| Virginia General Assembly bills (CSV) | `lis.blob.core.windows.net` | none |
+| Virginia LIS API (enrichment) | `lis.virginia.gov` | optional (see below) |
+
+The ability works without any API key — it falls back to the public hourly CSV from the LIS blob storage. The LIS API key is optional and only used if the CSV fetch returns nothing.
 
 ## Setup
-1. **Trigger Words**: Set triggers like "Town Hall," "Morning Briefing," or "What's happening at City Hall?"
-2. **Location**: Currently pre-configured for **Richmond, VA** and the **Virginia State Legislature**.
-3. **Data Sources**:
-    - Richmond City Council: Scraped from `richmondva.legistar.com`.
-    - Virginia State: Monitoring focus on current session bills.
 
-## How to Use
-- *"Hey OpenHome, give me my Town Hall briefing."*
-- *"What is the City Council discussing today?"*
-- *"Draft an email to my commissioner about the new zoning permit."*
+### 1. Trigger words
+
+Set at least one of the trigger words above in the Dashboard when you install the ability.
+
+### 2. LIS API key (optional)
+
+To enable the Virginia LIS REST API as a fallback when the public CSV is unavailable:
+
+1. Register for a free developer key at [lis.virginia.gov/developers](https://lis.virginia.gov/developers).
+2. In the OpenHome Dashboard, go to **Settings → Third-Party Keys** and add a new key:
+   - **Label:** `LIS_API_KEY`
+   - **Value:** your key (format: `XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX`)
+
+The ability will log `LIS_API_KEY resolved successfully` on startup when the key is found, or a warning with setup instructions if it is missing.
+
+## Usage Examples
+
+- *"Hey OpenHome, town hall."*
+- *"Give me my morning briefing."*
+- *"What's happening at city hall?"*
 
 ## Developer Notes
-- **Watchdog Loop**: The ability runs a background loop every hour to update `townhall_briefing.md`.
-- **Context Injection**: Uses Openhome's Ambient Context Injection to ensure the Agent always has the latest meeting IDs and bill summaries in its system prompt.
-- **Gaps**: Check `knowledge_gaps.json` in the ability directory to see what civic information users are asking for that isn't yet covered.
+
+- **Sources** are modular — each lives in `sources/` and implements `CivicSource`. Adding a new government data source means adding one file there and registering it in `sources/__init__.py`.
+- **Watchdog loop** starts on `call()`, refreshes every 3600 seconds, and writes to `townhall_briefing.md`.
+- **API errors** — a 401/403 from the LIS API surfaces as a clear spoken error with the key label to look up. Check agent logs for `LIS_API_KEY` messages.
+- **Knowledge gaps** — logged to `knowledge_gaps.json` when the agent can't answer a civic question. Review this file to guide future source additions.
+- **No `print()` calls** — all logging uses `self.worker.editor_logging_handler`.

@@ -11,23 +11,14 @@ REQUEST_TIMEOUT = 60
 
 
 class VirginiaStateSource(CivicSource):
-    def __init__(self, api_key: Optional[str] = None):
-        super().__init__()
-        self._api_key = api_key
-
-    def set_api_key(self, api_key: Optional[str]) -> None:
-        self._api_key = api_key
-
     def get_name(self) -> str:
         return "Virginia General Assembly"
 
     def get_source_url(self) -> str:
         return "https://lis.virginia.gov/"
 
-    def _resolve_api_key(self) -> Optional[str]:
-        if self._api_key:
-            return self._api_key.strip() or None
-        return None
+    def required_api_key_name(self) -> str:
+        return "LIS_API_KEY"
 
     def _headers(self, api_key: str) -> dict:
         return {
@@ -201,7 +192,7 @@ class VirginiaStateSource(CivicSource):
         return selected
 
     async def fetch_updates(self) -> str:
-        api_key = self._resolve_api_key()
+        api_key = self._api_key
         if not api_key:
             return (
                 "### Virginia General Assembly\n"

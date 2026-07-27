@@ -5,9 +5,6 @@ from src.main import AgentWorker
 from src.agent.capability_worker import CapabilityWorker
 
 from .sources import discover_sources
-from .sources.virginia_state import VirginiaStateSource
-
-LIS_API_KEY_NAME = "LIS_API_KEY"
 
 BRIEFING_FILE = "townhall_briefing.md"
  
@@ -19,29 +16,29 @@ class TownHallCapability(MatchingCapability):
 
     #{{register capability}}
 
-    def _resolve_lis_key(self) -> str | None:
+    def _resolve_api_key(self, key_name: str) -> str | None:
         try:
-            key = self.capability_worker.get_api_keys(LIS_API_KEY_NAME)
+            key = self.capability_worker.get_api_keys(key_name)
         except Exception as e:
             self.worker.editor_logging_handler.warning(
-                f"LIS key lookup raised an error: {e}"
+                f"{key_name} lookup raised an error: {e}"
             )
             return None
         if key and str(key).strip():
-            self.worker.editor_logging_handler.info("LIS_API_KEY resolved successfully")
+            self.worker.editor_logging_handler.info(f"{key_name} resolved successfully")
             return str(key).strip()
         self.worker.editor_logging_handler.warning(
-            f"LIS key not found. Add a third-party key named '{LIS_API_KEY_NAME}' in Settings."
+            f"{key_name} not found. Add a third-party key named '{key_name}' in Settings."
         )
         return None
 
     def _bind_sources(self):
-        """attach worker for session_tasks http + inject lis api key."""
-        key = self._resolve_lis_key()
+        """attach worker and inject any required api keys for each source."""
         for source in self.SOURCES:
             source.bind_worker(self.worker)
-            if isinstance(source, VirginiaStateSource):
-                source.set_api_key(key)
+            key_name = source.required_api_key_name()
+            if key_name:
+                source.set_api_key(self._resolve_api_key(key_name))
 
     async def log_gap(self, query: str, reason: str):
         gap_data = {

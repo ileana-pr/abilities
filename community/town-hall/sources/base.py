@@ -24,10 +24,20 @@ class CivicSource(ABC):
 
     def __init__(self):
         self._worker = None
+        self._api_key: Optional[str] = None
 
     def bind_worker(self, worker: Any) -> None:
         """attach openhome worker so sources can use session_tasks http helpers."""
         self._worker = worker
+
+    def required_api_key_name(self) -> Optional[str]:
+        """override to declare the third-party key name this source needs.
+        return None if no api key is required."""
+        return None
+
+    def set_api_key(self, api_key: Optional[str]) -> None:
+        """called by the capability coordinator after resolving required_api_key_name."""
+        self._api_key = api_key.strip() if api_key else None
 
     @abstractmethod
     def get_name(self) -> str:

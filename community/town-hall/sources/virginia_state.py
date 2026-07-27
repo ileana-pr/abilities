@@ -1,4 +1,3 @@
-import csv
 import re
 from html import unescape
 from typing import Optional
@@ -6,16 +5,9 @@ from typing import Optional
 from .base import CivicSource
 
 LIS_BASE = "https://lis.virginia.gov"
-CSV_BASE = "https://lis.blob.core.windows.net/lisfiles"
 TOPIC_QUERIES = ("housing", "education", "zoning")
 MAX_BILLS = 8
 REQUEST_TIMEOUT = 60
-# 2026 regular, then special, then 2025 regular
-SESSION_CANDIDATES = (
-    (20261, "2026 Regular Session"),
-    (20262, "2026 Special Session"),
-    (20251, "2025 Regular Session"),
-)
 
 
 class VirginiaStateSource(CivicSource):
@@ -44,80 +36,6 @@ class VirginiaStateSource(CivicSource):
             "Accept": "application/json",
             "User-Agent": "OpenHome-TownHall/1.0",
         }
-
-    async def _fetch_bills_csv(self, session_code: int) -> list[dict]:
-        """public hourly CSV — no api key required. prefer a byte range for speed."""
-        url = f"{CSV_BASE}/{session_code}/BILLS.CSV"
-        # partial download keeps the voice session awake (full file is ~1.3MB)
-        resp = await self._http_get(
-            url,
-            headers={"Accept": "text/csv", "Range": "bytes=0-250000"},
-            timeout=REQUEST_TIMEOUT,
-        )
-        if resp.status_code >= 400 or not resp.text:
-            # fall back to full file
-            resp = await self._http_get(
-                url, headers={"Accept": "text/csv"}, timeout=REQUEST_TIMEOUT
-            )
-        if resp.status_code >= 400 or not resp.text:
-            return []
-        text = resp.text
-        # strip utf-8 bom if present
-        if text.startswith("\ufeff"):
-            text = text[1:]
-        lines = text.splitlines()
-        # drop a possibly truncated final line from Range responses
-        if len(lines) > 2 and lines[-1].count('"') % 2 == 1:
-            lines = lines[:-1]
-        reader = csv.DictReader(lines)
-        bills: list[dict] = []
-        topic_hits = 0
-        for row in reader:
-            bill_id = (row.get("Bill_id") or row.get("Bill_ID") or "").strip()
-            if not bill_id:
-                continue
-            failed = (row.get("Failed") or "").strip().upper()
-            desc = (row.get("Bill_description") or row.get("Bill_Description") or "").strip()
-            patron = (row.get("Patron_name") or row.get("Patron_Name") or "").strip()
-            status = self._status_from_csv_row(row)
-            bill = {
-                "LegislationNumber": bill_id,
-                "FullNumber": bill_id,
-                "Description": desc,
-                "LegislationTitle": desc,
-                "LegislationStatus": status,
-                "LegislationTypeCode": "B" if bill_id.upper().startswith(("HB", "SB")) else "",
-                "Patrons": [{"Name": patron, "IsIntroducing": True}] if patron else [],
-                "_failed": failed == "Y",
-            }
-            bills.append(bill)
-            lower = desc.lower()
-            if any(topic in lower for topic in TOPIC_QUERIES):
-                topic_hits += 1
-            # enough for a voice briefing — stop scanning early
-            if topic_hits >= MAX_BILLS and len(bills) >= MAX_BILLS * 3:
-                break
-        return bills
-
-    @staticmethod
-    def _status_from_csv_row(row: dict) -> str:
-        if (row.get("Approved") or "").strip().upper() == "Y":
-            return "Approved"
-        if (row.get("Vetoed") or "").strip().upper() == "Y":
-            return "Vetoed"
-        if (row.get("Passed") or "").strip().upper() == "Y":
-            return "Passed"
-        if (row.get("Failed") or "").strip().upper() == "Y":
-            return "Failed"
-        if (row.get("Carried_over") or "").strip().upper() == "Y":
-            return "Carried Over"
-        house = (row.get("Last_house_action") or "").strip()
-        senate = (row.get("Last_senate_action") or "").strip()
-        if house:
-            return house
-        if senate:
-            return senate
-        return "In progress"
 
     async def _fetch_via_api(self, api_key: str) -> tuple[str, list[dict]]:
         url = f"{LIS_BASE}/Session/api/getsessionlistasync"
@@ -172,13 +90,6 @@ class VirginiaStateSource(CivicSource):
         payload = resp.json() or {}
         bills = payload.get("Legislations") or payload.get("ListItems") or []
         return label, bills
-
-    async def _fetch_via_csv(self) -> tuple[str, list[dict]]:
-        for session_code, label in SESSION_CANDIDATES:
-            bills = await self._fetch_bills_csv(session_code)
-            if bills:
-                return label, bills
-        return "2026 Regular Session", []
 
     @staticmethod
     def _strip_html(text: str) -> str:
@@ -290,33 +201,26 @@ class VirginiaStateSource(CivicSource):
         return selected
 
     async def fetch_updates(self) -> str:
-        label = "2026 Regular Session"
-        bills: list[dict] = []
-        errors: list[str] = []
+        api_key = self._resolve_api_key()
+        if not api_key:
+            return (
+                "### Virginia General Assembly\n"
+                "- Error: LIS_API_KEY not set. "
+                "Add a third-party key named 'LIS_API_KEY' in Settings → Third-Party Keys."
+            )
 
-        # public CSV first — works without custom auth headers in the sandbox http helper
         try:
-            label, bills = await self._fetch_via_csv()
+            label, bills = await self._fetch_via_api(api_key)
         except Exception as e:
-            errors.append(f"csv: {e}")
-
-        # optional api enrichment if csv empty and key is present
-        if not bills:
-            api_key = self._resolve_api_key()
-            if api_key:
-                try:
-                    label, bills = await self._fetch_via_api(api_key)
-                except Exception as e:
-                    errors.append(f"api: {e}")
-            else:
-                errors.append("api: LIS_API_KEY not available to ability runtime")
+            return (
+                f"### Virginia General Assembly\n"
+                f"- Error fetching legislation from LIS API: {e}"
+            )
 
         selected = self._select_bills(bills)
         lines = [f"### Virginia General Assembly ({label})"]
         if not selected:
             lines.append("- No matching legislation found for current focus topics.")
-            if errors:
-                lines.append(f"- Note: fetch issues ({'; '.join(errors)})")
             lines.append(f"- Source: {self.get_source_url()}")
             return "\n".join(lines)
 

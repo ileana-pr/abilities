@@ -5,14 +5,15 @@ from src.main import AgentWorker
 from src.agent.capability_worker import CapabilityWorker
 
 from .sources import discover_sources
+from .sources.base import CivicSource
 
 BRIEFING_FILE = "townhall_briefing.md"
- 
+
+
 class TownHallCapability(MatchingCapability):
     worker: AgentWorker = None
     capability_worker: CapabilityWorker = None
-
-    SOURCES = discover_sources()
+    sources: list = []
 
     #{{register capability}}
 
@@ -34,11 +35,21 @@ class TownHallCapability(MatchingCapability):
 
     def _bind_sources(self):
         """attach worker and inject any required api keys for each source."""
-        for source in self.SOURCES:
+        for source in self.sources:
             source.bind_worker(self.worker)
             key_name = source.required_api_key_name()
             if key_name:
                 source.set_api_key(self._resolve_api_key(key_name))
+
+    def _filter_sources(self, phrase: str) -> list[CivicSource]:
+        """return sources whose trigger_keywords match the phrase.
+        falls back to all sources if nothing matches or source declares no keywords."""
+        phrase_lower = phrase.lower()
+        matched = [
+            s for s in self.sources
+            if s.trigger_keywords() and any(kw in phrase_lower for kw in s.trigger_keywords())
+        ]
+        return matched if matched else self.sources
 
     async def log_gap(self, query: str, reason: str):
         gap_data = {
@@ -62,8 +73,8 @@ class TownHallCapability(MatchingCapability):
             filename, content, in_ability_directory=False
         )
 
-    async def read_cached_briefing(self) -> str | None:
-        """return a usable cached briefing if present."""
+    async def read_cached_briefing(self, active_sources: list[CivicSource]) -> str | None:
+        """return a usable cached briefing if present and all active sources validate it."""
         exists = await self.capability_worker.check_if_file_exists(
             BRIEFING_FILE, in_ability_directory=False
         )
@@ -77,24 +88,24 @@ class TownHallCapability(MatchingCapability):
             return None
         if not content:
             return None
-        # reject empty/error-only caches
-        if "Error fetching" in content and "HB" not in content and "Meeting ID" not in content:
+        if not all(source.validate_cache(content) for source in active_sources):
             return None
         return content
 
-    async def collect_briefing(self, announce: bool = False) -> str:
-        """fetch all sources now and refresh the ambient briefing file."""
+    async def collect_briefing(
+        self, active_sources: list[CivicSource], announce: bool = False
+    ) -> str:
+        """fetch active sources and refresh the ambient briefing file."""
         self._bind_sources()
+        source_names = ", ".join(s.get_name() for s in active_sources)
         aggregated = [
-            "# TownHall Civic Briefing\n"
-            f"Build: resp-fix-v5\n"
+            f"# TownHall Civic Briefing\n"
+            f"Sources: {source_names}\n"
             f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
         ]
-        for source in self.SOURCES:
+        for source in active_sources:
             if announce:
-                await self.capability_worker.speak(
-                    f"Checking {source.get_name()}."
-                )
+                await self.capability_worker.speak(f"Checking {source.get_name()}.")
             self.worker.editor_logging_handler.info(f"Polling source: {source.get_name()}")
             updates = await source.fetch_updates()
             self.worker.editor_logging_handler.info(
@@ -108,7 +119,9 @@ class TownHallCapability(MatchingCapability):
         )
         return final_context
 
-    async def collect_briefing_with_keepalive(self) -> str:
+    async def collect_briefing_with_keepalive(
+        self, active_sources: list[CivicSource]
+    ) -> str:
         """fetch while speaking short keepalives so sleep mode does not trip."""
         stop = {"done": False}
 
@@ -120,7 +133,7 @@ class TownHallCapability(MatchingCapability):
 
         self.worker.session_tasks.create(_keepalive())
         try:
-            return await self.collect_briefing(announce=True)
+            return await self.collect_briefing(active_sources, announce=True)
         finally:
             stop["done"] = True
 
@@ -129,27 +142,42 @@ class TownHallCapability(MatchingCapability):
         await self.worker.session_tasks.sleep(3.0)
         while True:
             try:
-                await self.collect_briefing(announce=False)
+                await self.collect_briefing(self.sources, announce=False)
             except Exception as e:
                 self.worker.editor_logging_handler.error(
-                    f"TownHall Coordinator Error: {e}"
+                    f"TownHall watchdog error: {e}"
                 )
             await self.worker.session_tasks.sleep(3600.0)
 
     async def run(self):
+        # get the trigger phrase that activated this ability if the worker exposes it
+        trigger_phrase = (
+            getattr(self.worker, "trigger_phrase", "")
+            or getattr(self.worker, "matched_phrase", "")
+            or ""
+        )
+
         await self.capability_worker.speak(
             "Town Hall is standing by. Would you like your morning briefing?"
         )
         user_input = await self.capability_worker.user_response()
 
         if "briefing" in user_input.lower() or "yes" in user_input.lower():
+            # route to relevant sources using trigger phrase, then user input as fallback
+            routing_phrase = trigger_phrase or user_input
+            active_sources = self._filter_sources(routing_phrase)
+            source_names = ", ".join(s.get_name() for s in active_sources)
+            self.worker.editor_logging_handler.info(
+                f"Routing to sources: {source_names} (phrase: '{routing_phrase}')"
+            )
+
             await self.capability_worker.speak("One sec. Pulling the latest civic updates.")
             try:
-                briefing = await self.read_cached_briefing()
+                briefing = await self.read_cached_briefing(active_sources)
                 if briefing:
                     self.worker.editor_logging_handler.info("Using cached briefing")
                 else:
-                    briefing = await self.collect_briefing_with_keepalive()
+                    briefing = await self.collect_briefing_with_keepalive(active_sources)
             except Exception as e:
                 self.worker.editor_logging_handler.error(
                     f"TownHall briefing fetch error: {e}"
@@ -162,8 +190,8 @@ class TownHallCapability(MatchingCapability):
 
             summary = self.capability_worker.text_to_text_response(
                 "You are giving a short spoken morning civic briefing. "
-                "Using ONLY the briefing text below, summarize the most important "
-                "upcoming Richmond meetings and Virginia bills in 4 to 6 short sentences. "
+                f"Using ONLY the briefing text below, summarize the most important "
+                f"updates from {source_names} in 4 to 6 short sentences. "
                 "Do not mention documents, databases, or missing context. "
                 "If a section contains an error message, quote the key error briefly "
                 "so we can debug, then cover whatever else is available. "
@@ -197,6 +225,7 @@ class TownHallCapability(MatchingCapability):
     def call(self, worker: AgentWorker):
         self.worker = worker
         self.capability_worker = CapabilityWorker(self.worker)
+        self.sources = discover_sources()
         self._bind_sources()
         self.worker.session_tasks.create(self.watchdog_loop())
         self.worker.session_tasks.create(self.run())

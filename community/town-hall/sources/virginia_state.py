@@ -20,6 +20,9 @@ class VirginiaStateSource(CivicSource):
     def required_api_key_name(self) -> str:
         return "LIS_API_KEY"
 
+    def trigger_keywords(self) -> tuple[str, ...]:
+        return ("virginia",)
+
     def _headers(self, api_key: str) -> dict:
         return {
             "WebAPIKey": api_key,

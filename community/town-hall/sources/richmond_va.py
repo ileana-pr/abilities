@@ -13,6 +13,9 @@ class RichmondCitySource(CivicSource):
     def get_source_url(self) -> str:
         return "https://richmondva.legistar.com/Calendar.aspx"
 
+    def trigger_keywords(self) -> tuple[str, ...]:
+        return ("richmond",)
+
     async def fetch_updates(self) -> str:
         url = "https://richmondva.legistar.com/Calendar.aspx"
         headers = {

@@ -39,6 +39,32 @@ class CivicSource(ABC):
         """called by the capability coordinator after resolving required_api_key_name."""
         self._api_key = api_key.strip() if api_key else None
 
+    def trigger_keywords(self) -> tuple[str, ...]:
+        """override to declare which keywords in the trigger phrase activate this source.
+        return an empty tuple to always include this source regardless of trigger."""
+        return ()
+
+    def validate_cache(self, content: str) -> bool:
+        """return False if this source's section in the aggregated briefing looks errored.
+        the coordinator uses this to decide whether to serve or discard a cached briefing."""
+        name = self.get_name()
+        marker = f"### {name}"
+        if marker not in content:
+            return True
+        start = content.index(marker)
+        end = content.find("---", start)
+        section = content[start:end] if end != -1 else content[start:]
+        data_lines = [
+            l.strip() for l in section.split("\n")
+            if l.strip() and not l.strip().startswith("#")
+        ]
+        if not data_lines:
+            return False
+        return not all(
+            l.lower().startswith("- error") or l.lower().startswith("error")
+            for l in data_lines
+        )
+
     @abstractmethod
     def get_name(self) -> str:
         pass

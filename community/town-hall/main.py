@@ -149,13 +149,34 @@ class TownHallCapability(MatchingCapability):
                 )
             await self.worker.session_tasks.sleep(3600.0)
 
+    async def _capture_trigger_phrase(self) -> str:
+        """capture the utterance that activated this ability so sources can be routed.
+        AgentWorker exposes no trigger attribute — read the transcription, then history."""
+        try:
+            spoken = await self.capability_worker.wait_for_complete_transcription()
+            if spoken and spoken.strip():
+                return spoken.strip().lower()
+        except Exception as e:
+            self.worker.editor_logging_handler.warning(
+                f"trigger transcription unavailable: {e}"
+            )
+        try:
+            history = self.capability_worker.get_full_message_history()
+            if history:
+                last = history[-1]
+                if isinstance(last, dict):
+                    if last.get("role") == "user":
+                        return (last.get("content") or "").lower()
+                elif getattr(last, "role", None) == "user":
+                    return (getattr(last, "content", "") or "").lower()
+        except Exception as e:
+            self.worker.editor_logging_handler.warning(
+                f"trigger history unavailable: {e}"
+            )
+        return ""
+
     async def run(self):
-        # get the trigger phrase that activated this ability if the worker exposes it
-        trigger_phrase = (
-            getattr(self.worker, "trigger_phrase", "")
-            or getattr(self.worker, "matched_phrase", "")
-            or ""
-        )
+        trigger_phrase = await self._capture_trigger_phrase()
 
         await self.capability_worker.speak(
             "Town Hall is standing by. Would you like your morning briefing?"
@@ -163,8 +184,8 @@ class TownHallCapability(MatchingCapability):
         user_input = await self.capability_worker.user_response()
 
         if "briefing" in user_input.lower() or "yes" in user_input.lower():
-            # route to relevant sources using trigger phrase, then user input as fallback
-            routing_phrase = trigger_phrase or user_input
+            # route on the trigger utterance plus the reply, so either can name a jurisdiction
+            routing_phrase = f"{trigger_phrase} {user_input}".strip()
             active_sources = self._filter_sources(routing_phrase)
             source_names = ", ".join(s.get_name() for s in active_sources)
             self.worker.editor_logging_handler.info(

@@ -41,15 +41,16 @@ class TownHallCapability(MatchingCapability):
             if key_name:
                 source.set_api_key(self._resolve_api_key(key_name))
 
-    def _filter_sources(self, phrase: str) -> list[CivicSource]:
-        """return sources whose trigger_keywords match the phrase.
-        falls back to all sources if nothing matches or source declares no keywords."""
+    def _match_sources(self, phrase: str) -> list[CivicSource]:
+        """sources whose keywords appear in the phrase, plus any that declare none.
+        returns an empty list when the phrase names no jurisdiction."""
         phrase_lower = phrase.lower()
         matched = [
             s for s in self.sources
             if s.trigger_keywords() and any(kw in phrase_lower for kw in s.trigger_keywords())
         ]
-        return matched if matched else self.sources
+        always_on = [s for s in self.sources if not s.trigger_keywords()]
+        return matched + always_on
 
     async def log_gap(self, query: str, reason: str):
         gap_data = {
@@ -150,97 +151,70 @@ class TownHallCapability(MatchingCapability):
             await self.worker.session_tasks.sleep(3600.0)
 
     async def _capture_trigger_phrase(self) -> str:
-        """capture the utterance that activated this ability so sources can be routed.
-        AgentWorker exposes no trigger attribute — read the transcription, then history."""
+        """the utterance that activated this ability, used to pick sources."""
         try:
             spoken = await self.capability_worker.wait_for_complete_transcription()
-            if spoken and spoken.strip():
-                return spoken.strip().lower()
+            return (spoken or "").strip().lower()
         except Exception as e:
             self.worker.editor_logging_handler.warning(
-                f"trigger transcription unavailable: {e}"
+                f"trigger capture unavailable: {e}"
             )
-        try:
-            history = self.capability_worker.get_full_message_history()
-            if history:
-                last = history[-1]
-                if isinstance(last, dict):
-                    if last.get("role") == "user":
-                        return (last.get("content") or "").lower()
-                elif getattr(last, "role", None) == "user":
-                    return (getattr(last, "content", "") or "").lower()
-        except Exception as e:
-            self.worker.editor_logging_handler.warning(
-                f"trigger history unavailable: {e}"
+            return ""
+
+    async def _choose_sources(self) -> list[CivicSource]:
+        """route straight from the trigger phrase; ask only if it names no jurisdiction."""
+        phrase = await self._capture_trigger_phrase()
+        active = self._match_sources(phrase)
+        if active:
+            self.worker.editor_logging_handler.info(
+                f"Routed '{phrase}' to {', '.join(s.get_name() for s in active)}"
             )
-        return ""
+            return active
+        options = " or ".join(s.get_name() for s in self.sources)
+        await self.capability_worker.speak(f"Which briefing would you like — {options}?")
+        answer = await self.capability_worker.user_response()
+        return self._match_sources(answer) or self.sources
 
     async def run(self):
-        trigger_phrase = await self._capture_trigger_phrase()
+        active_sources = await self._choose_sources()
+        source_names = ", ".join(s.get_name() for s in active_sources)
+
+        await self.capability_worker.speak(f"Pulling the latest from {source_names}.")
+        try:
+            briefing = await self.read_cached_briefing(active_sources)
+            if briefing:
+                self.worker.editor_logging_handler.info("Using cached briefing")
+            else:
+                briefing = await self.collect_briefing_with_keepalive(active_sources)
+        except Exception as e:
+            self.worker.editor_logging_handler.error(
+                f"TownHall briefing fetch error: {e}"
+            )
+            await self.capability_worker.speak(
+                "I couldn't reach the civic sources right now. Try again in a minute."
+            )
+            self.capability_worker.resume_normal_flow()
+            return
+
+        summary = self.capability_worker.text_to_text_response(
+            "You are giving a short spoken civic briefing. "
+            f"Using ONLY the briefing text below, summarize the most important "
+            f"updates from {source_names} in 4 to 6 short sentences. "
+            "Do not mention documents, databases, or missing context. "
+            "If a section contains an error, say briefly that the source was "
+            "unavailable, then cover whatever else is there. "
+            "Speak plainly for a smart speaker.\n\n"
+            f"BRIEFING TEXT:\n{briefing}"
+        )
+        await self.capability_worker.speak(summary)
+
+        for source in active_sources:
+            if not source.validate_cache(briefing):
+                await self.log_gap(source.get_name(), "Source returned no usable data.")
 
         await self.capability_worker.speak(
-            "Town Hall is standing by. Would you like your morning briefing?"
+            "Would you like me to draft a message to any of these offices?"
         )
-        user_input = await self.capability_worker.user_response()
-
-        if "briefing" in user_input.lower() or "yes" in user_input.lower():
-            # route on the trigger utterance plus the reply, so either can name a jurisdiction
-            routing_phrase = f"{trigger_phrase} {user_input}".strip()
-            active_sources = self._filter_sources(routing_phrase)
-            source_names = ", ".join(s.get_name() for s in active_sources)
-            self.worker.editor_logging_handler.info(
-                f"Routing to sources: {source_names} (phrase: '{routing_phrase}')"
-            )
-
-            await self.capability_worker.speak("One sec. Pulling the latest civic updates.")
-            try:
-                briefing = await self.read_cached_briefing(active_sources)
-                if briefing:
-                    self.worker.editor_logging_handler.info("Using cached briefing")
-                else:
-                    briefing = await self.collect_briefing_with_keepalive(active_sources)
-            except Exception as e:
-                self.worker.editor_logging_handler.error(
-                    f"TownHall briefing fetch error: {e}"
-                )
-                await self.capability_worker.speak(
-                    "I couldn't reach the civic sources right now. Try again in a minute."
-                )
-                self.capability_worker.resume_normal_flow()
-                return
-
-            summary = self.capability_worker.text_to_text_response(
-                "You are giving a short spoken morning civic briefing. "
-                f"Using ONLY the briefing text below, summarize the most important "
-                f"updates from {source_names} in 4 to 6 short sentences. "
-                "Do not mention documents, databases, or missing context. "
-                "If a section contains an error message, quote the key error briefly "
-                "so we can debug, then cover whatever else is available. "
-                "Speak plainly for a smart speaker.\n\n"
-                f"BRIEFING TEXT:\n{briefing}"
-            )
-            await self.capability_worker.speak(summary)
-
-            lower = briefing.lower()
-            if (
-                "error fetching" in lower
-                or "fetch issues" in lower
-                or "http worker not bound" in lower
-            ):
-                snippet = briefing.replace("\n", " ")
-                if len(snippet) > 350:
-                    snippet = snippet[:350]
-                await self.capability_worker.speak(f"Debug details: {snippet}")
-
-            await self.capability_worker.speak(
-                "Would you like me to draft a message to any of these offices?"
-            )
-        else:
-            response = self.capability_worker.text_to_text_response(user_input)
-            await self.capability_worker.speak(response)
-            if "don't know" in response.lower():
-                await self.log_gap(user_input, "Information not in modular sources.")
-
         self.capability_worker.resume_normal_flow()
 
     def call(self, worker: AgentWorker):

@@ -2,10 +2,11 @@
   "name": "townhall",
   "capability_id": "7377",
   "category": "skill",
-  "description": "townhall ability",
+  "description": "Voice civic briefings from official government sources. Get upcoming Richmond City Council meetings and active Virginia General Assembly legislation summarized for a smart speaker. Built to extend to any city, county, state, or federal body.",
   "trigger_words": [
     "virginia town hall",
-    "richmond morning briefing"
+    "richmond morning briefing",
+    "town hall"
   ],
   "release_id": 17254,
   "version": "v4",

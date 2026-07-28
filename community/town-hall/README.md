@@ -10,8 +10,11 @@ A voice-activated civic briefing ability for OpenHome. Ask your agent what's hap
 
 | Phrase | What it does |
 | --- | --- |
-| `"virginia town hall"` | briefing focused on Virginia General Assembly activity |
-| `"richmond morning briefing"` | briefing focused on Richmond City Council meetings |
+| `"virginia town hall"` | goes straight to the Virginia General Assembly briefing |
+| `"richmond morning briefing"` | goes straight to the Richmond City Council briefing |
+| `"town hall"` | asks which briefing you want, then delivers it |
+
+Naming a jurisdiction in the trigger skips straight to that briefing — no confirmation step. The generic `"town hall"` trigger is the only one that asks a follow-up question.
 
 ---
 
@@ -19,7 +22,7 @@ A voice-activated civic briefing ability for OpenHome. Ask your agent what's hap
 
 | Source | Level | Auth |
 | --- | --- | --- |
-| Virginia General Assembly (LIS) | State | none (CSV) / optional API key |
+| Virginia General Assembly (LIS) | State | `LIS_API_KEY` required |
 | Richmond City Council (Legistar) | City | none |
 
 ### Planned Sources
@@ -39,9 +42,9 @@ A voice-activated civic briefing ability for OpenHome. Ask your agent what's hap
 
 Set at least one of the trigger phrases listed above in the Dashboard when you install the ability.
 
-### 2. LIS API key (optional — Virginia only)
+### 2. LIS API key (required for the Virginia source)
 
-The Virginia source works without a key using the public LIS CSV feed. For API access as a fallback:
+The Virginia General Assembly source reads from the LIS REST API and will report an error without a key:
 
 1. Register for a free key at [lis.virginia.gov/developers](https://lis.virginia.gov/developers).
 2. In the OpenHome Dashboard, go to **Settings → Third-Party Keys** and add:
@@ -54,8 +57,9 @@ The ability logs `LIS_API_KEY resolved successfully` on startup if the key is fo
 
 ## Usage Examples
 
-- *"Hey OpenHome, virginia town hall."*
-- *"Richmond morning briefing."*
+- *"Hey OpenHome, virginia town hall."* → Virginia bills, immediately
+- *"Richmond morning briefing."* → Richmond meetings, immediately
+- *"Town hall."* → *"Which briefing would you like — Virginia General Assembly or Richmond City Council?"*
 
 ---
 
@@ -153,4 +157,4 @@ We welcome sources for any city, county, state, or federal body. The pattern is 
 
 - **Adding a federal source** — U.S. Congress data is available via the [congress.gov API](https://api.congress.gov/) (free key). A `FederalCongressSource` following the same pattern is on the roadmap.
 - **Adding more city sources** — Legistar (used for Richmond) powers hundreds of city council sites. A generic `LegistarCitySource` that accepts a city subdomain would cover many U.S. cities at once.
-- **Knowledge gaps** — unanswered civic questions are logged to `knowledge_gaps.json` in the ability directory. Review this to prioritize which sources to add next.
+- **Knowledge gaps** — when a source returns no usable data, it is logged to `knowledge_gaps.json` in the ability directory. Review this to see which jurisdictions are failing and prioritize fixes.

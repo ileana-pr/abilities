@@ -94,7 +94,7 @@ HTTP helpers (`_http_get`, `_http_post`) are available on the base class — no 
 
 ### Watchdog loop
 
-On startup, Town Hall warms the briefing cache immediately, then refreshes every hour. Briefings are written to `townhall_briefing.md` in the agent's context directory so responses are instant even when sources are slow.
+On startup, Town Hall warms the briefing cache immediately, then refreshes daily. Briefings are written to `townhall_briefing.md` in the agent's context directory so responses are instant even when sources are slow.
 
 ---
 

@@ -139,7 +139,7 @@ class TownHallCapability(MatchingCapability):
             stop["done"] = True
 
     async def watchdog_loop(self):
-        """warm cache quickly, then refresh hourly."""
+        """warm cache quickly, then refresh daily."""
         await self.worker.session_tasks.sleep(3.0)
         while True:
             try:
@@ -148,7 +148,7 @@ class TownHallCapability(MatchingCapability):
                 self.worker.editor_logging_handler.error(
                     f"TownHall watchdog error: {e}"
                 )
-            await self.worker.session_tasks.sleep(3600.0)
+            await self.worker.session_tasks.sleep(86400.0)
 
     async def _capture_trigger_phrase(self) -> str:
         """the utterance that activated this ability, used to pick sources."""

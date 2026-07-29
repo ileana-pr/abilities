@@ -460,7 +460,7 @@ We welcome sources for any city, county, state, or federal body. The pattern is 
            return "### Your City Council\n- ..."
    ```
 
-3. Auto-discovery handles registration — just add your file to `sources/` and it will be found automatically. No registration needed!
+3. Register your source in `sources/__init__.py` by importing it and appending an instance to the list returned by `discover_sources()`. (OpenHome forbids dynamic imports, so registration is explicit.)
 
 4. If your source needs an API key, follow the same pattern as `virginia_state.py` — accept the key via `set_api_key()` and document the label name in your source's docstring and in this README.
 

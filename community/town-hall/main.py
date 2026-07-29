@@ -57,11 +57,15 @@ class TownHallCapability(MatchingCapability):
         )
 
     async def _bind_sources(self):
-        """inject api keys and topic preferences for each source."""
+        """inject api keys, worker, and topic preferences for each source."""
         # load topic preferences
         topic_prefs = await self._load_topic_preferences()
         
         for source in self.sources:
+            # bind worker for http requests
+            source.bind_worker(self.worker)
+            
+            # inject api key if needed
             key_name = source.required_api_key_name()
             if key_name:
                 source.set_api_key(self._resolve_api_key(key_name))

@@ -1,4 +1,3 @@
-import requests
 from abc import ABC, abstractmethod
 from typing import Optional
 
@@ -8,6 +7,7 @@ class CivicSource(ABC):
 
     def __init__(self):
         self._api_key: Optional[str] = None
+        self._worker = None
 
     def required_api_key_name(self) -> Optional[str]:
         """override to declare the third-party key name this source needs.
@@ -80,12 +80,26 @@ class CivicSource(ABC):
         """return additional metadata about this source (optional)."""
         return {}
 
-    def _http_get(self, url: str, headers: dict = None, timeout: float = 30) -> requests.Response:
-        """simple http get using requests library."""
-        return requests.get(url, headers=headers, timeout=timeout)
+    def bind_worker(self, worker):
+        """bind the worker for http requests."""
+        self._worker = worker
 
-    def _http_post(
-        self, url: str, headers: dict = None, json_body: dict = None, timeout: float = 30
-    ) -> requests.Response:
-        """simple http post using requests library."""
-        return requests.post(url, headers=headers, json=json_body, timeout=timeout)
+    def _http_get(self, url: str, headers: dict = None):
+        """http get using openhome sdk."""
+        if not self._worker:
+            raise RuntimeError("worker not bound - call bind_worker() first")
+        response = self._worker.session_tasks.get(url, headers=headers or {})
+        # normalize response to have .text attribute
+        if not hasattr(response, 'text'):
+            response.text = response if isinstance(response, str) else str(response)
+        return response
+
+    def _http_post(self, url: str, headers: dict = None, json_body: dict = None):
+        """http post using openhome sdk."""
+        if not self._worker:
+            raise RuntimeError("worker not bound - call bind_worker() first")
+        response = self._worker.session_tasks.post(url, headers=headers or {}, json=json_body)
+        # normalize response
+        if not hasattr(response, 'text'):
+            response.text = response if isinstance(response, str) else str(response)
+        return response

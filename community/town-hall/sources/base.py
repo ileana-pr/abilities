@@ -2,6 +2,18 @@ from abc import ABC, abstractmethod
 from typing import Optional
 
 
+class _SimpleResponse:
+    """minimal response wrapper for sdk results that are plain strings."""
+
+    def __init__(self, text: str):
+        self.text = text
+        self.status_code = 200
+
+    @property
+    def content(self) -> bytes:
+        return self.text.encode("utf-8", errors="ignore")
+
+
 class CivicSource(ABC):
     """base class for all civic data sources (cities, counties, states)."""
 
@@ -84,22 +96,25 @@ class CivicSource(ABC):
         """bind the worker for http requests."""
         self._worker = worker
 
-    def _http_get(self, url: str, headers: dict = None):
-        """http get using openhome sdk."""
+    @staticmethod
+    def _normalize_response(response):
+        """wrap plain-string sdk results so callers can rely on .text/.status_code."""
+        if hasattr(response, "status_code"):
+            return response
+        text = response if isinstance(response, str) else str(response)
+        return _SimpleResponse(text)
+
+    def _http_get(self, url: str, headers: dict = None, timeout: float = None):
+        """http get using openhome sdk. timeout is accepted for call-site
+        compatibility but the sdk manages request timeouts itself."""
         if not self._worker:
             raise RuntimeError("worker not bound - call bind_worker() first")
         response = self._worker.session_tasks.get(url, headers=headers or {})
-        # normalize response to have .text attribute
-        if not hasattr(response, 'text'):
-            response.text = response if isinstance(response, str) else str(response)
-        return response
+        return self._normalize_response(response)
 
-    def _http_post(self, url: str, headers: dict = None, json_body: dict = None):
+    def _http_post(self, url: str, headers: dict = None, json_body: dict = None, timeout: float = None):
         """http post using openhome sdk."""
         if not self._worker:
             raise RuntimeError("worker not bound - call bind_worker() first")
         response = self._worker.session_tasks.post(url, headers=headers or {}, json=json_body)
-        # normalize response
-        if not hasattr(response, 'text'):
-            response.text = response if isinstance(response, str) else str(response)
-        return response
+        return self._normalize_response(response)

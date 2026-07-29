@@ -44,34 +44,9 @@ Naming a jurisdiction in the trigger skips straight to that briefing — no conf
 
 ## Setup
 
-### Cloud Mode vs. Local Mode
+### 1. Dependencies
 
-Town Hall supports two operating modes:
-
-**Cloud Mode** (`OPENHOME_CLOUD_MODE=1`):
-- Basic meeting listings with dates, times, and links
-- No PDF parsing or legislation tracking
-- Works on OpenHome cloud platform (restricted environment)
-- No external dependencies required
-
-**Local Mode** (default):
-- Full PDF parsing of agendas and minutes
-- Richmond legislation tracking with natural language search
-- Detailed agenda item extraction
-- Requires `pdftotext` system utility
-
-### 1. Install dependencies
-
-For **local mode** with full features, install the `pdftotext` utility:
-
-```bash
-cd community/town-hall
-pip install -r requirements.txt
-```
-
-Required packages:
-- `pypdf>=4.0.0` - for parsing PDF agenda documents
-- `requests>=2.31.0` - for HTTP requests
+None. All data comes from public web APIs over plain HTTP using the OpenHome SDK — no external Python packages or system utilities required. The ability runs identically on the OpenHome cloud platform and in local development.
 
 ### 2. Trigger words
 
@@ -117,12 +92,11 @@ The ability logs `LIS_API_KEY resolved successfully` on startup if the key is fo
 **What happens:**
 
 1. **Trigger routing** — The word "richmond" in your phrase routes directly to the Richmond City Council source
-2. **Fetch live data** — Richmond source makes HTTP GET to `richmondva.legistar.com/Calendar.aspx`
-3. **Parse HTML** — Extracts upcoming meeting IDs and agenda availability using regex
-4. **Format briefing** — Builds markdown with 5 upcoming meetings, each showing meeting ID and agenda status
-5. **Cache the result** — Writes `townhall_briefing.md` to context directory for instant future access
-6. **LLM summarization** — The agent's LLM converts markdown to 4-6 natural spoken sentences
-7. **Speak the briefing** — Agent reads the summary aloud
+2. **Fetch live data** — Richmond source queries the Legistar Web API (`webapi.legistar.com/v1/richmondva/events`) for meetings in a window from 3 days back to 14 days ahead
+3. **Format briefing** — Builds markdown with numbered upcoming meetings, each showing date, time, and agenda status
+4. **Cache the result** — Writes `townhall_briefing.md` to context directory for instant future access
+5. **LLM summarization** — The agent's LLM converts markdown to 4-6 natural spoken sentences
+6. **Speak the briefing** — Agent reads the summary aloud
 
 **Example spoken output:**
 > "There are 8 upcoming meetings this week. The City Council meets Monday, July 27 at 6:00 PM. The Commission of Architectural Review meets Tuesday, July 28 at 3:30 PM. The Public Safety Standing Committee meets Tuesday, July 28 at 1:00 PM. Say details on meeting 1 or tell me about City Council to learn more."
@@ -135,7 +109,7 @@ Trigger matched → sources filtered by keyword "richmond"
   ↓
 RichmondCitySource.fetch_updates()
   ↓
-HTTP GET https://richmondva.legistar.com/Calendar.aspx
+HTTP GET https://webapi.legistar.com/v1/richmondva/events (JSON)
   ↓
 Parse: 8 meetings found in next 7 days
   ↓
@@ -293,10 +267,9 @@ When you set topic preferences, future Richmond briefings will:
 
 1. **Parse reference** — Agent extracts meeting reference (number, name, or ID)
 2. **Route to source** — Main capability routes request to Richmond source's `get_details()` method
-3. **Fetch agenda/minutes** — Richmond source downloads PDF document from Legistar
-4. **Parse PDF content** — Extracts agenda items using pypdf library
-5. **Format response** — Returns structured markdown with meeting info and agenda items
-6. **Speak summary** — Agent summarizes the agenda items naturally
+3. **Fetch agenda items** — Richmond source queries the Legistar Web API (`/events/{id}/eventitems`)
+4. **Format response** — Returns structured markdown with meeting info and agenda items (legislation items first)
+5. **Speak summary** — Agent summarizes the agenda items naturally
 
 **Example conversation:**
 > **User:** "Richmond city"  
@@ -306,24 +279,22 @@ When you set topic preferences, future Richmond briefings will:
 
 **What gets extracted:**
 
-Richmond's Legistar system provides PDFs with agenda items. The capability:
-- Downloads the PDF (typically 50-500KB)
-- Extracts text from first 5 pages
-- Identifies numbered agenda items (1., 2., 3... or A., B., C... or I., II., III...)
+The Legistar Web API returns structured agenda items for each meeting. The capability:
+- Fetches items via `GET /v1/richmondva/events/{EventId}/eventitems`
+- Prefers items tied to legislation (ordinances/resolutions with file numbers) over procedural boilerplate
 - Cleans and formats each item (max 150 chars)
 - Returns up to 15 items in the spoken briefing
 
 **Multiple reference formats supported:**
 - By number: `"details on meeting 1"`, `"meeting 3"`
 - By body name: `"tell me about City Council"`, `"Planning Commission meeting"`
-- By meeting ID: `"get details for 1354765"` (from previous briefings)
+- By meeting ID: `"get details for 5180"` (from previous briefings)
 
 **Fallback behavior:**
 
-If PDF parsing fails or pypdf is not installed:
-- Returns meeting metadata (date, time, location, document size)
-- Provides direct link to PDF on Legistar site
-- User can still access full document via browser
+If agenda items are not yet published for a meeting:
+- Returns meeting metadata (date, time, location)
+- Provides direct links to the agenda/minutes PDFs on Legistar when available
 
 ---
 
@@ -333,11 +304,10 @@ If PDF parsing fails or pypdf is not installed:
 
 **What happens:**
 
-1. **Fetch recent agendas** — Downloads PDFs from last 5 meetings
-2. **Extract legislation** — Parses ordinances (ORD.) and resolutions (RES.) from agenda text
-3. **Deduplicate** — Tracks by ID to avoid showing same item multiple times
-4. **Format by type** — Groups ordinances and resolutions separately
-5. **Summarize** — LLM creates natural summary of pending items
+1. **Query the Legistar Web API** — `GET /v1/richmondva/matters` filtered to ordinances and resolutions introduced in the last 60 days
+2. **Sanity-check** — Skips API rows with dirty dates (a few historical records carry bad metadata)
+3. **Format by type** — Groups ordinances and resolutions separately, each with its current status (Adopted, Consent Agenda, etc.)
+4. **Summarize** — LLM creates natural summary of pending items
 
 **Example conversation:**
 > **User:** "Richmond legislation"  
@@ -345,9 +315,10 @@ If PDF parsing fails or pypdf is not installed:
 
 **What gets tracked:**
 
-From actual meeting agendas:
+From the city's official legislative records:
 - **Ordinances (ORD.)**: Land use, zoning, code amendments, special use permits
 - **Resolutions (RES.)**: Bond approvals, appointments, policy statements
+- **Status for each item**: Adopted, Consent Agenda, Regular Agenda, Withdrawn, etc.
 
 **Example items:**
 ```
@@ -385,11 +356,11 @@ The search looks for keywords in ordinance descriptions and returns:
 
 **Why this approach:**
 
-Rather than scraping a separate legislation API (which requires complex AJAX handling), we extract legislation from meeting agendas we're already parsing. This gives us:
-- **Active legislation**: Only items currently on meeting agendas (actually being discussed)
-- **No additional API**: Reuses existing Legistar calendar integration
-- **Context**: Legislation appears with meeting info (when it will be voted on)
-- **Performance**: Already have the data from meeting briefings
+Richmond runs on Legistar (by Granicus), which exposes an official public web API at `webapi.legistar.com/v1/richmondva/`. Using it instead of scraping HTML or parsing PDFs gives us:
+- **Structured data**: File numbers, titles, statuses, and dates as clean JSON — no fragile parsing
+- **Current status**: Each item reports where it stands (Adopted, Consent Agenda, Withdrawn...)
+- **Cloud compatible**: Plain HTTP GET works within the OpenHome platform's module restrictions
+- **Reusable pattern**: Hundreds of U.S. cities use Legistar — the same code works by swapping the client name in the URL
 
 ---
 
@@ -436,11 +407,15 @@ class CivicSource(ABC):
     def get_source_url(self) -> str: ...     # canonical URL for the data source
     async def fetch_updates(self) -> str:    # returns a markdown-formatted briefing string
         ...
-    async def search(self, query: str) -> str: ...     # optional
-    async def get_details(self, item_id: str) -> str:  # optional
+    # optional features — base class provides default stubs; override where available
+    async def search(self, query: str) -> str: ...
+    async def get_details(self, item_id: str) -> str: ...
+    async def fetch_legislation(self) -> str: ...
+    def set_topic_preferences(self, topics: list[str]) -> None: ...
+    def get_topic_preferences(self) -> list[str]: ...
 ```
 
-HTTP helpers (`_http_get`, `_http_post`) are available on the base class using the standard `requests` library.
+HTTP helpers (`_http_get`, `_http_post`) are available on the base class via the OpenHome SDK (`worker.session_tasks`). Call `bind_worker()` first (the coordinator does this automatically).
 
 ### Watchdog loop
 
@@ -487,7 +462,7 @@ We welcome sources for any city, county, state, or federal body. The pattern is 
 
 - Return a markdown string from `fetch_updates()` — the agent's LLM converts it to speech.
 - Keep the output concise: 5–10 bullet points max. This is a voice briefing, not a report.
-- Use `self._http_get()` for all HTTP calls — the base class uses `requests` internally, so you get standard Response objects.
+- Use `self._http_get()` for all HTTP calls — the base class routes through the OpenHome SDK (`worker.session_tasks`) and returns response-like objects with `.text` and `.status_code`.
 - Surface errors as strings in the return value (e.g. `"Error fetching ... HTTP 403"`) rather than raising — the briefing aggregator will include them so the agent can report and debug.
 - No `print()` — logging is available via the platform when needed.
 - No hardcoded API keys — use placeholders and document the key label in the README.

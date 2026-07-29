@@ -48,6 +48,11 @@ class RichmondCitySource(CivicSource):
     def _matches_topics(self, meeting: dict, topics: list[str]) -> bool:
         """check if meeting matches any user topic interest (catalog or free-form)."""
         body = meeting.get('body', '').lower()
+        return self._text_matches_topics(body, topics)
+
+    def _text_matches_topics(self, text: str, topics: list[str]) -> bool:
+        """true if text contains any keyword for the user's topics."""
+        text_lower = (text or '').lower()
         for topic in topics:
             keywords = list(DEFAULT_TOPICS.get(topic, [topic]))
             # free-form multi-word topics: also match significant individual words
@@ -55,9 +60,14 @@ class RichmondCitySource(CivicSource):
                 for word in topic.split():
                     if len(word) > 3 and word not in keywords:
                         keywords.append(word)
-            if any(kw in body for kw in keywords):
+            if any(kw in text_lower for kw in keywords):
                 return True
         return False
+
+    def _legislation_matches_topics(self, leg: dict, topics: list[str]) -> bool:
+        """check if a legislation item matches user topic preferences."""
+        blob = f"{leg.get('description', '')} {leg.get('file', '')}"
+        return self._text_matches_topics(blob, topics)
 
     # ------------------------------------------------------------------
     # legistar web api helpers
@@ -335,27 +345,51 @@ class RichmondCitySource(CivicSource):
                 "- No ordinances or resolutions introduced in the last 60 days."
             )
 
+        topics = self.get_topic_preferences()
         lines = ["### Richmond City Legislation"]
         lines.append(f"\n{len(legislation)} items introduced in the last 60 days:\n")
 
-        ordinances = [l for l in legislation if l['type'] == 'Ordinance']
-        resolutions = [l for l in legislation if l['type'] == 'Resolution']
+        # when the user has topics, lead with matching items
+        if topics:
+            topic_hits = [l for l in legislation if self._legislation_matches_topics(l, topics)]
+            others = [l for l in legislation if l not in topic_hits]
 
-        if ordinances:
-            lines.append(f"**Ordinances ({len(ordinances)}):**")
-            for leg in ordinances[:10]:
-                lines.append(self._format_legislation_entry(leg))
+            if topic_hits:
+                topic_list = ", ".join(topics)
+                lines.append(f"**Matching your topics ({topic_list}) — {len(topic_hits)}:**")
+                for leg in topic_hits[:10]:
+                    lines.append(self._format_legislation_entry(leg))
+                if len(topic_hits) > 10:
+                    lines.append(f"\n...plus {len(topic_hits) - 10} more topic matches")
 
-        if resolutions:
-            lines.append(f"\n**Resolutions ({len(resolutions)}):**")
-            for leg in resolutions[:10]:
-                lines.append(self._format_legislation_entry(leg))
+            if others:
+                lines.append(f"\n**Other recent items ({len(others)}):**")
+                for leg in others[:10]:
+                    lines.append(self._format_legislation_entry(leg))
+                if len(others) > 10:
+                    lines.append(f"\n...plus {len(others) - 10} more items")
+        else:
+            ordinances = [l for l in legislation if l['type'] == 'Ordinance']
+            resolutions = [l for l in legislation if l['type'] == 'Resolution']
 
-        shown = min(len(ordinances), 10) + min(len(resolutions), 10)
-        if len(legislation) > shown:
-            lines.append(f"\n*Showing {shown} of {len(legislation)} items.*")
+            if ordinances:
+                lines.append(f"**Ordinances ({len(ordinances)}):**")
+                for leg in ordinances[:10]:
+                    lines.append(self._format_legislation_entry(leg))
 
-        lines.append("\nAsk about any item by number (e.g., 'ORD. 2026-172') or by topic (e.g., 'the housing ordinance').")
+            if resolutions:
+                lines.append(f"\n**Resolutions ({len(resolutions)}):**")
+                for leg in resolutions[:10]:
+                    lines.append(self._format_legislation_entry(leg))
+
+            shown = min(len(ordinances), 10) + min(len(resolutions), 10)
+            if len(legislation) > shown:
+                lines.append(f"\n*Showing {shown} of {len(legislation)} items.*")
+
+        lines.append(
+            "\nAsk about any item by number (e.g., 'ORD. 2026-172') or by topic "
+            "(e.g., 'the housing ordinance')."
+        )
 
         return '\n'.join(lines)
 

@@ -101,9 +101,17 @@ The ability logs `LIS_API_KEY resolved successfully` on startup if the key is fo
 4. **Cache the result** — Writes `townhall_briefing.md` to context directory for instant future access
 5. **LLM summarization** — The agent's LLM converts markdown to 4-6 natural spoken sentences
 6. **Speak the briefing** — Agent reads the summary aloud
+7. **Follow-up loop** — Agent asks whether you want meeting details, recent legislation, or something else (up to 3 turns), then exits when you say you're done
 
 **Example spoken output:**
-> "There are 8 upcoming meetings this week. The City Council meets Monday, July 27 at 6:00 PM. The Commission of Architectural Review meets Tuesday, July 28 at 3:30 PM. The Public Safety Standing Committee meets Tuesday, July 28 at 1:00 PM. Say details on meeting 1 or tell me about City Council to learn more."
+> "There are 8 upcoming meetings this week. The City Council meets Monday, July 27 at 6:00 PM. The Commission of Architectural Review meets Tuesday, July 28 at 3:30 PM. The Public Safety Standing Committee meets Tuesday, July 28 at 1:00 PM."  
+> **Agent:** "Want details on a meeting, recent legislation, or something else from that briefing? Or say you're done."  
+> **User:** "Any new legislation?"  
+> **Agent:** *(topic-prioritized ordinances/resolutions summary)*  
+> **User:** "Details on meeting 1"  
+> **Agent:** *(City Council agenda highlights)*  
+> **User:** "I'm done."  
+> **Agent:** "Okay."
 
 **Behind the scenes:**
 ```
@@ -133,6 +141,8 @@ Cache → townhall_briefing.md
 LLM summarizes → natural speech
   ↓
 Agent speaks summary
+  ↓
+Follow-up loop (legislation / meeting details / briefing Q&A) → done
 ```
 
 ---
@@ -148,12 +158,17 @@ Agent speaks summary
 3. **Fetch session list** — HTTP GET to `lis.virginia.gov/Session/api/getsessionlistasync`
 4. **Pick current session** — Ranks sessions by active status, regular vs special, and year; chooses 2026 Regular Session
 5. **Fetch legislation** — HTTP GET to legislation list API for chosen session
-6. **Filter and score** — Prioritizes bills matching focus topics (housing, education, zoning), limits to 8 bills
+6. **Filter and score** — Prioritizes bills matching the user's topic preferences (falls back to housing/education/zoning), limits to 8 bills
 7. **Format briefing** — Each bill shows number, description (max 160 chars), status, and patron
 8. **Cache and summarize** — Same as Richmond (cache → LLM → speech)
+9. **Follow-up loop** — Same post-briefing invitation as Richmond: ask about a bill/topic from the briefing, or say you're done. (Virginia's briefing *is* legislation, so asking for "legislation" re-highlights bills from that briefing.)
 
 **Example spoken output:**
-> "The Virginia General Assembly has eight active bills from the 2026 Regular Session. House Bill 1234 on affordable housing is in committee. Senate Bill 567 on school funding passed the Senate. House Bill 890 on zoning reform is awaiting a vote..."
+> "The Virginia General Assembly has eight active bills from the 2026 Regular Session. House Bill 1234 on affordable housing is in committee. Senate Bill 567 on school funding passed the Senate. House Bill 890 on zoning reform is awaiting a vote..."  
+> **Agent:** "Want details on a meeting, recent legislation, or something else from that briefing? Or say you're done."  
+> **User:** "Anything on housing?"  
+> **Agent:** *(answers from the briefing text)*  
+> **User:** "Done."
 
 **Behind the scenes:**
 ```
@@ -331,14 +346,15 @@ If agenda items are not yet published for a meeting:
 
 ### Scenario 7: Richmond Legislation Tracking
 
-**User says:** *"Richmond legislation"*
+**User says:** *"Richmond legislation"* (also works as an in-session follow-up after a Richmond meeting briefing: *"any new legislation?"*)
 
 **What happens:**
 
 1. **Query the Legistar Web API** — `GET /v1/richmondva/matters` filtered to ordinances and resolutions introduced in the last 60 days
 2. **Sanity-check** — Skips API rows with dirty dates (a few historical records carry bad metadata)
-3. **Format by type** — Groups ordinances and resolutions separately, each with its current status (Adopted, Consent Agenda, etc.)
-4. **Summarize** — LLM creates natural summary of pending items
+3. **Topic priority** — If the user has topic preferences, matching items are listed first under a "Matching your topics" heading; remaining items follow
+4. **Format by type** — When no topics are set, groups ordinances and resolutions separately, each with its current status
+5. **Summarize** — LLM creates natural summary of pending items
 
 **Example conversation:**
 > **User:** "Richmond legislation"  

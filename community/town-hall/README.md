@@ -44,9 +44,25 @@ Naming a jurisdiction in the trigger skips straight to that briefing — no conf
 
 ## Setup
 
+### Cloud Mode vs. Local Mode
+
+Town Hall supports two operating modes:
+
+**Cloud Mode** (`OPENHOME_CLOUD_MODE=1`):
+- Basic meeting listings with dates, times, and links
+- No PDF parsing or legislation tracking
+- Works on OpenHome cloud platform (restricted environment)
+- No external dependencies required
+
+**Local Mode** (default):
+- Full PDF parsing of agendas and minutes
+- Richmond legislation tracking with natural language search
+- Detailed agenda item extraction
+- Requires `pdftotext` system utility
+
 ### 1. Install dependencies
 
-The town-hall capability requires additional Python packages for PDF parsing:
+For **local mode** with full features, install the `pdftotext` utility:
 
 ```bash
 cd community/town-hall

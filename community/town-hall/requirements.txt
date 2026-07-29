@@ -1,1 +1,6 @@
-# no external dependencies - uses system pdftotext utility
+# no external python dependencies
+#
+# Optional system utilities (for local mode with PDF parsing):
+# - pdftotext: Install via `apt-get install poppler-utils` (Linux) or `brew install poppler` (macOS)
+#
+# Cloud mode (OPENHOME_CLOUD_MODE=1): Disables PDF parsing, only requires OpenHome SDK

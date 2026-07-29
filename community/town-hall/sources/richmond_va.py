@@ -1,16 +1,23 @@
 import re
-import subprocess
 from datetime import datetime, timedelta
 from typing import Optional
+import os
 
 from .base import CivicSource
 
-# check for pdftotext utility
-try:
-    subprocess.run(['pdftotext', '-v'], capture_output=True, timeout=2)
-    HAS_PDFTOTEXT = True
-except (FileNotFoundError, subprocess.TimeoutExpired):
-    HAS_PDFTOTEXT = False
+# cloud mode: disable features that require restricted modules (subprocess, io, pypdf)
+# set OPENHOME_CLOUD_MODE=1 environment variable to enable cloud compatibility
+CLOUD_MODE = os.environ.get('OPENHOME_CLOUD_MODE', '0') == '1'
+
+# pdf parsing available only in local mode
+HAS_PDFTOTEXT = False
+if not CLOUD_MODE:
+    try:
+        import subprocess
+        subprocess.run(['pdftotext', '-v'], capture_output=True, timeout=2)
+        HAS_PDFTOTEXT = True
+    except (FileNotFoundError, subprocess.TimeoutExpired, NameError):
+        HAS_PDFTOTEXT = False
 
 DEFAULT_TOPICS = {
     'housing': ['housing', 'affordable housing', 'residential', 'development'],
@@ -415,8 +422,24 @@ class RichmondCitySource(CivicSource):
                 f"- No agenda or minutes available yet for this meeting"
             )
 
-        # fetch the document (usually PDF)
+        # in cloud mode, just return links without PDF parsing
+        if CLOUD_MODE:
+            lines = [
+                f"### {body} - {date_str}",
+                f"- Time: {meeting.get('time', 'TBD')}",
+                f"- Location: {meeting.get('location', 'TBD')}"
+            ]
+            if meeting.get('has_agenda'):
+                lines.append(f"- **Agenda:** {meeting.get('agenda_url')}")
+            if meeting.get('has_minutes'):
+                lines.append(f"- **Minutes:** {meeting.get('minutes_url')}")
+            lines.append("\n*PDF parsing not available in cloud mode*")
+            return '\n'.join(lines)
+
+        # local mode: fetch and parse PDF
         try:
+            import subprocess  # only import if not in cloud mode
+            
             resp = self._http_get(content_url, timeout=20)
             if resp.status_code >= 400:
                 return f"### {body} - {date_str}\n- Error fetching {content_type.lower()}: HTTP {resp.status_code}"
@@ -643,6 +666,10 @@ class RichmondCitySource(CivicSource):
     
     def _get_legislation_summary(self) -> str:
         """get quick legislation summary from cached meetings (synchronous)."""
+        # cloud mode: skip legislation summary
+        if CLOUD_MODE:
+            return ""
+        
         # only process if we have recent meetings with agendas
         meetings_with_agendas = [m for m in self._recent_meetings[:3] if m.get('has_agenda')]
         if not meetings_with_agendas:
@@ -660,6 +687,14 @@ class RichmondCitySource(CivicSource):
     
     async def fetch_legislation(self) -> str:
         """fetch and summarize pending legislation from recent meeting agendas."""
+        # cloud mode: legislation tracking requires PDF parsing (not available)
+        if CLOUD_MODE:
+            return (
+                "### Richmond City Legislation\n\n"
+                "*Legislation tracking requires PDF parsing capabilities not available in cloud mode. *\n"
+                "*Check meeting agendas directly on Richmond Legistar for ordinances and resolutions.*"
+            )
+        
         # use recent meetings cache if available
         if not self._recent_meetings:
             # trigger a meeting fetch

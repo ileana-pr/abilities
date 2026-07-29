@@ -35,45 +35,62 @@ class TownHallCapability(MatchingCapability):
         )
         return None
 
-    async def _load_topic_preferences(self) -> dict:
-        """load user's topic preferences from file."""
+    async def _load_topic_preferences(self) -> list[str]:
+        """load the user's topic preferences (shared across all sources)."""
         exists = await self.capability_worker.check_if_file_exists(
             TOPICS_FILE, in_ability_directory=True
         )
         if not exists:
-            return {}
-        
+            return []
+
         content = await self.capability_worker.read_file(
             TOPICS_FILE, in_ability_directory=True
         )
-        return json.loads(content) if content else {}
+        if not content:
+            return []
 
-    async def _save_topic_preferences(self, preferences: dict) -> None:
-        """save topic preferences to file."""
+        data = json.loads(content)
+
+        # current format: {"topics": ["housing", "zoning"]}
+        if isinstance(data, dict) and isinstance(data.get("topics"), list):
+            return [t for t in data["topics"] if isinstance(t, str)]
+
+        # legacy per-source format: {"Richmond City Council": ["housing"], ...}
+        if isinstance(data, dict):
+            topics = []
+            for value in data.values():
+                if isinstance(value, list):
+                    for topic in value:
+                        if isinstance(topic, str) and topic not in topics:
+                            topics.append(topic)
+            return topics
+
+        return []
+
+    async def _save_topic_preferences(self, topics: list[str]) -> None:
+        """save user-level topic preferences."""
         await self.capability_worker.write_file(
             TOPICS_FILE,
-            json.dumps(preferences, indent=2),
-            in_ability_directory=True
+            json.dumps({"topics": topics}, indent=2),
+            in_ability_directory=True,
         )
 
     async def _bind_sources(self):
         """inject api keys, worker, and topic preferences for each source."""
-        # load topic preferences
-        topic_prefs = await self._load_topic_preferences()
-        
+        topics = await self._load_topic_preferences()
+
         for source in self.sources:
             # bind worker for http requests
             source.bind_worker(self.worker)
-            
+
             # inject api key if needed
             key_name = source.required_api_key_name()
             if key_name:
                 source.set_api_key(self._resolve_api_key(key_name))
-            
-            # inject topic preferences (no-op on sources that don't override)
-            source_topics = topic_prefs.get(source.get_name(), [])
-            if source_topics:
-                source.set_topic_preferences(source_topics)
+
+            # same user topics applied to every source that supports filtering
+            if topics:
+                source.set_topic_preferences(topics)
 
     def _match_sources(self, phrase: str) -> list[CivicSource]:
         """sources whose keywords appear in the phrase, plus any that declare none.
@@ -195,9 +212,8 @@ class TownHallCapability(MatchingCapability):
             )
             return ""
 
-    async def _choose_sources(self) -> list[CivicSource]:
-        """route straight from the trigger phrase; ask only if it names no jurisdiction."""
-        phrase = await self._capture_trigger_phrase()
+    async def _choose_sources(self, phrase: str) -> list[CivicSource]:
+        """route from the trigger phrase; ask only if it names no jurisdiction."""
         active = self._match_sources(phrase)
         if active:
             self.worker.editor_logging_handler.info(
@@ -221,39 +237,164 @@ class TownHallCapability(MatchingCapability):
         )
         return []
 
-    async def _configure_topics(self, source: CivicSource) -> None:
-        """interactive flow to set user topic preferences."""
-        await self.capability_worker.speak(
-            f"What topics are you interested in for {source.get_name()}? "
-            "You can say housing, zoning, transportation, education, public safety, or budget. "
-            "Say multiple topics separated by 'and'."
-        )
-        
-        response = await self.capability_worker.user_response()
-        
-        # parse topics from response
-        response_lower = response.lower()
+    def _parse_topics_from_response(self, response: str) -> list[str]:
+        """extract free-form topic phrases from spoken user input."""
+        text = (response or "").lower().strip()
+        if not text:
+            return []
+
+        # strip common lead-ins
+        for prefix in (
+            "i'm interested in",
+            "i am interested in",
+            "interested in",
+            "i care about",
+            "add",
+            "also add",
+            "my topics are",
+            "topics are",
+            "topics",
+        ):
+            if text.startswith(prefix):
+                text = text[len(prefix):].strip()
+                break
+
+        # split on and / also / plus / commas / semicolons
+        parts = re.split(r"\s*(?:,|;|\band\b|\balso\b|\bplus\b)\s*", text)
+
         topics = []
-        for topic in ['housing', 'zoning', 'transportation', 'education', 'public safety', 'budget']:
-            if topic in response_lower:
-                topics.append(topic)
-        
-        if not topics:
-            await self.capability_worker.speak("I didn't catch any topics. Showing all meetings.")
+        skip = {"please", "thanks", "thank you", "yes", "okay", "ok", "um", "uh"}
+        for part in parts:
+            part = part.strip(" .!?'\"")
+            part = re.sub(r"^(the|a|an|some|my)\s+", "", part)
+            if not part or len(part) < 2 or part in skip:
+                continue
+            if part not in topics:
+                topics.append(part)
+        return topics
+
+    async def _configure_topics(self) -> None:
+        """interactive flow to add user-level topic preferences (shared across sources)."""
+        existing = await self._load_topic_preferences()
+        if existing:
+            current = ", ".join(existing)
+            await self.capability_worker.speak(
+                f"Your current topics are {current}. "
+                "What would you like to add? You can name anything — for example housing, "
+                "zoning, parks, or climate. Say multiple topics separated by 'and'."
+            )
+        else:
+            await self.capability_worker.speak(
+                "What topics are you interested in? "
+                "You can name anything — for example housing, zoning, transportation, "
+                "parks, or climate. Say multiple topics separated by 'and'."
+            )
+
+        response = await self.capability_worker.user_response()
+        new_topics = self._parse_topics_from_response(response)
+
+        if not new_topics:
+            await self.capability_worker.speak(
+                "I didn't catch any topics. Your existing preferences are unchanged."
+            )
             return
-        
-        # save preferences
-        prefs = await self._load_topic_preferences()
-        prefs[source.get_name()] = topics
-        await self._save_topic_preferences(prefs)
-        
-        # apply to source
-        source.set_topic_preferences(topics)
-        
-        topic_list = ', '.join(topics)
+
+        # append new topics; keep prior ones
+        merged = list(existing)
+        added = []
+        for topic in new_topics:
+            if topic not in merged:
+                merged.append(topic)
+                added.append(topic)
+
+        if not added:
+            await self.capability_worker.speak(
+                "Those topics are already on your list. No changes made."
+            )
+            return
+
+        await self._save_topic_preferences(merged)
+        self._apply_topics_to_sources(merged)
+
+        added_list = ", ".join(added)
+        all_list = ", ".join(merged)
         await self.capability_worker.speak(
-            f"Got it. I'll prioritize {topic_list} meetings for {source.get_name()}."
+            f"Added {added_list}. I'll prioritize {all_list} across your civic briefings."
         )
+
+    def _apply_topics_to_sources(self, topics: list[str]) -> None:
+        """push the current user topic list into every registered source."""
+        for source in self.sources:
+            source.set_topic_preferences(topics)
+
+    async def _remove_topics(self) -> None:
+        """interactive flow to remove topics from the user's preference list."""
+        existing = await self._load_topic_preferences()
+        if not existing:
+            await self.capability_worker.speak(
+                "You don't have any topic preferences saved."
+            )
+            return
+
+        current = ", ".join(existing)
+        await self.capability_worker.speak(
+            f"Your current topics are {current}. "
+            "Which should I remove? Say the topic names, or say clear all."
+        )
+
+        response = await self.capability_worker.user_response()
+        response_lower = (response or "").lower().strip()
+
+        # wipe the whole list
+        if any(
+            phrase in response_lower
+            for phrase in (
+                "clear all",
+                "clear everything",
+                "remove all",
+                "delete all",
+                "all of them",
+                "everything",
+            )
+        ):
+            await self._save_topic_preferences([])
+            self._apply_topics_to_sources([])
+            await self.capability_worker.speak("Cleared all topic preferences.")
+            return
+
+        to_remove = self._parse_topics_from_response(response)
+        if not to_remove:
+            await self.capability_worker.speak(
+                "I didn't catch which topics to remove. Your list is unchanged."
+            )
+            return
+
+        removed = []
+        remaining = []
+        for topic in existing:
+            if topic in to_remove:
+                removed.append(topic)
+            else:
+                remaining.append(topic)
+
+        if not removed:
+            await self.capability_worker.speak(
+                "None of those matched your saved topics. Your list is unchanged."
+            )
+            return
+
+        await self._save_topic_preferences(remaining)
+        self._apply_topics_to_sources(remaining)
+
+        removed_list = ", ".join(removed)
+        if remaining:
+            await self.capability_worker.speak(
+                f"Removed {removed_list}. I'll prioritize {', '.join(remaining)} across your civic briefings."
+            )
+        else:
+            await self.capability_worker.speak(
+                f"Removed {removed_list}. You have no topic preferences left."
+            )
 
     async def _handle_details_request(self, phrase: str, active_sources: list[CivicSource]) -> bool:
         """check if this is a details request and handle it. returns True if handled."""
@@ -346,36 +487,43 @@ class TownHallCapability(MatchingCapability):
 
 
     async def run(self):
-        active_sources = await self._choose_sources()
+        phrase = await self._capture_trigger_phrase()
+
+        # topic config is user-level — no jurisdiction needed
+        if 'configure' in phrase or 'set topics' in phrase:
+            await self._configure_topics()
+            self.capability_worker.resume_normal_flow()
+            return
+
+        if (
+            'remove topics' in phrase
+            or 'delete topics' in phrase
+            or 'clear topics' in phrase
+            or (('remove' in phrase or 'delete' in phrase) and 'topic' in phrase)
+        ):
+            await self._remove_topics()
+            self.capability_worker.resume_normal_flow()
+            return
+
+        active_sources = await self._choose_sources(phrase)
         if not active_sources:
             self.capability_worker.resume_normal_flow()
             return
-        
-        # check if user wants to configure topics (on first time or explicit request)
-        phrase = await self._capture_trigger_phrase()
-        
+
         # handle details requests
         if await self._handle_details_request(phrase, active_sources):
             return
-        
-        # handle topic configuration
-        if 'configure' in phrase or 'set topics' in phrase:
-            for source in active_sources:
-                await self._configure_topics(source)
-            self.capability_worker.resume_normal_flow()
-            return
-        
-        # ask if user wants to configure topics (first time only)
-        prefs = await self._load_topic_preferences()
-        for source in active_sources:
-            if source.get_name() not in prefs:
-                await self.capability_worker.speak(
-                    "Would you like to set topic preferences to prioritize certain meetings?"
-                )
-                response = await self.capability_worker.user_response()
-                if 'yes' in response.lower():
-                    await self._configure_topics(source)
-        
+
+        # offer topic setup once if the user has none yet
+        topics = await self._load_topic_preferences()
+        if not topics:
+            await self.capability_worker.speak(
+                "Would you like to set topic preferences to prioritize certain meetings?"
+            )
+            response = await self.capability_worker.user_response()
+            if 'yes' in response.lower():
+                await self._configure_topics()
+
         source_names = ", ".join(s.get_name() for s in active_sources)
         await self.capability_worker.speak(f"Pulling the latest from {source_names}.")
         try:

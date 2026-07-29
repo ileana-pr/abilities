@@ -12,9 +12,12 @@
     "richmond legislation",
     "town hall",
     "configure topics",
-    "set topics"
+    "set topics",
+    "remove topics",
+    "delete topics",
+    "clear topics"
   ],
-  "release_id": 17254,
-  "version": "v4",
+  "release_id": 17404,
+  "version": "v5",
   "is_committed": true
 }

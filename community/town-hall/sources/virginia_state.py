@@ -11,6 +11,10 @@ REQUEST_TIMEOUT = 60
 
 
 class VirginiaStateSource(CivicSource):
+    def __init__(self):
+        super().__init__()
+        self._topic_preferences = []
+
     def get_name(self) -> str:
         return "Virginia General Assembly"
 
@@ -22,6 +26,12 @@ class VirginiaStateSource(CivicSource):
 
     def trigger_keywords(self) -> tuple[str, ...]:
         return ("virginia",)
+
+    def set_topic_preferences(self, topics: list[str]) -> None:
+        self._topic_preferences = [t.lower() for t in topics]
+
+    def get_topic_preferences(self) -> list[str]:
+        return self._topic_preferences
 
     def _headers(self, api_key: str) -> dict:
         return {
@@ -169,6 +179,9 @@ class VirginiaStateSource(CivicSource):
         return f"- **{number}** — {desc} | {meta}\n  - {self._bill_url(bill)}"
 
     def _select_bills(self, bills: list[dict]) -> list[dict]:
+        # prefer user topics; fall back to built-in focus keywords when none set
+        topics = self.get_topic_preferences() or list(TOPIC_QUERIES)
+
         topic_hits: list[dict] = []
         other_bills: list[dict] = []
         seen: set[str] = set()
@@ -184,7 +197,7 @@ class VirginiaStateSource(CivicSource):
                 continue
             seen.add(key)
             text = self._search_text(bill)
-            if any(topic in text for topic in TOPIC_QUERIES):
+            if any(topic in text for topic in topics):
                 topic_hits.append(bill)
             elif self._is_bill(bill):
                 other_bills.append(bill)

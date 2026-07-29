@@ -19,6 +19,9 @@ A voice-activated civic briefing ability for OpenHome. Ask your agent what's hap
 | `"town hall"` | asks which briefing you want, then delivers it |
 | `"configure topics"` | opens interactive topic preference configuration |
 | `"set topics"` | opens interactive topic preference configuration |
+| `"remove topics"` | remove specific topics (or clear all) from preferences |
+| `"delete topics"` | same as remove topics |
+| `"clear topics"` | same as remove topics |
 
 Naming a jurisdiction in the trigger skips straight to that briefing — no confirmation step. The generic `"town hall"` trigger is the only one that asks a follow-up question. Topic configuration triggers allow you to set meeting preferences (housing, zoning, transportation, etc.).
 
@@ -73,7 +76,8 @@ The ability logs `LIS_API_KEY resolved successfully` on startup if the key is fo
 - *"Richmond city."* → Richmond meetings, immediately
 - *"Richmond city council."* → Richmond meetings, immediately
 - *"Town hall."* → *"Which briefing would you like?"* (user names a jurisdiction)
-- *"Configure topics."* → Interactive topic preference setup for meeting prioritization
+- *"Configure topics."* → Interactive free-form topic preference setup
+- *"Remove topics."* → Remove mistaken topics (or clear all)
 - *"Richmond legislation."* → Fetches and summarizes pending ordinances and resolutions
 - *"Get details on meeting 1."* → Fetches and summarizes specific meeting agenda
 - *"Get details on ORD. 2026-093."* → Looks up specific ordinance by ID
@@ -237,33 +241,52 @@ No crash, no stack trace — just a clear, actionable error message the agent ca
 
 **What happens:**
 
-1. **Trigger routing** — The phrase "configure topics" routes to topic configuration flow
-2. **Ask for topics** — Agent speaks: *"What topics are you interested in for Richmond City Council? You can say housing, zoning, transportation, education, public safety, or budget. Say multiple topics separated by 'and'."*
-3. **User responds** — User says: *"Housing and zoning"*
-4. **Save preferences** — Topic preferences stored in `topic_preferences.json`
-5. **Apply to source** — Richmond source will prioritize meetings matching housing/zoning keywords
-6. **Confirm** — Agent speaks: *"Got it. I'll prioritize housing, zoning meetings for Richmond City Council."*
+1. **Topic config trigger** — Handled before jurisdiction routing (no need to name a city/state)
+2. **Ask for topics** — Agent invites free-form interests (examples only: housing, zoning, parks, climate…). If topics already exist, it reads them back and asks what to **add**
+3. **User responds** — e.g. *"Housing and parks and climate"*
+4. **Parse freely** — Splits on "and"/commas; any phrase is accepted, not just a fixed catalog
+5. **Append** — New topics are added to the existing user list (duplicates skipped); nothing is wiped
+6. **Apply everywhere** — The full list is injected into every registered source that supports filtering
+7. **Confirm** — Agent speaks which topics were added and the full prioritized list
 
 **Example conversation:**
 > **User:** "Configure topics"  
-> **Agent:** "What topics are you interested in for Richmond City Council? You can say housing, zoning, transportation, education, public safety, or budget. Say multiple topics separated by 'and'."  
-> **User:** "Housing and zoning"  
-> **Agent:** "Got it. I'll prioritize housing, zoning meetings for Richmond City Council."
+> **Agent:** "What topics are you interested in? You can name anything — for example housing, zoning, transportation, parks, or climate..."  
+> **User:** "Housing and parks"  
+> **Agent:** "Added housing, parks. I'll prioritize housing, parks across your civic briefings."  
+> **User:** "Configure topics"  
+> **Agent:** "Your current topics are housing, parks. What would you like to add?"  
+> **User:** "Climate"  
+> **Agent:** "Added climate. I'll prioritize housing, parks, climate across your civic briefings."
 
 **How prioritization works:**
 
-When you set topic preferences, future Richmond briefings will:
-- Show meetings matching your topics first (e.g., Planning Commission, Housing Authority)
-- Then show other meetings (e.g., City Council, Finance Committee)
-- Still display all meetings, just reordered by relevance
+Topic preferences belong to the **user**, not a single locality. Known catalog topics (housing, zoning, etc.) expand to related keywords; free-form topics match on the phrase itself (and significant words). Richmond meetings, Virginia bills, and future sources all reuse the same list.
 
-**Topic keywords:**
+**Built-in keyword expansions** (optional boost for common topics):
 - `housing`: housing, affordable housing, residential, development
 - `zoning`: zoning, planning, land use, rezoning
 - `transportation`: transportation, transit, traffic, road, parking
 - `education`: school, education, schools
 - `public safety`: police, fire, safety, emergency
 - `budget`: budget, finance, appropriation
+
+### Removing topics
+
+**User says:** *"Remove topics"* (also `"delete topics"` / `"clear topics"`)
+
+**What happens:**
+
+1. Agent reads back the current list and asks which to remove
+2. User names one or more topics (same free-form parsing as add), **or** says *"clear all"*
+3. Matching items are dropped; the rest stay
+4. Agent confirms what was removed and what's left
+
+**Example:**
+> **User:** "Remove topics"  
+> **Agent:** "Your current topics are housing, parks, climate. Which should I remove? Say the topic names, or say clear all."  
+> **User:** "Parks"  
+> **Agent:** "Removed parks. I'll prioritize housing, climate across your civic briefings."
 
 ---
 

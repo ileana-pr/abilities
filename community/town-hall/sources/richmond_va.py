@@ -46,10 +46,15 @@ class RichmondCitySource(CivicSource):
         return self._topic_preferences
 
     def _matches_topics(self, meeting: dict, topics: list[str]) -> bool:
-        """check if meeting matches any user topic interest."""
+        """check if meeting matches any user topic interest (catalog or free-form)."""
         body = meeting.get('body', '').lower()
         for topic in topics:
-            keywords = DEFAULT_TOPICS.get(topic, [topic])
+            keywords = list(DEFAULT_TOPICS.get(topic, [topic]))
+            # free-form multi-word topics: also match significant individual words
+            if topic not in DEFAULT_TOPICS:
+                for word in topic.split():
+                    if len(word) > 3 and word not in keywords:
+                        keywords.append(word)
             if any(kw in body for kw in keywords):
                 return True
         return False

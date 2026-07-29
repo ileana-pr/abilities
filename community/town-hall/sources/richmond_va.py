@@ -43,7 +43,7 @@ class RichmondCitySource(CivicSource):
 
     def get_topic_preferences(self) -> list[str]:
         """retrieve stored topic preferences."""
-        return getattr(self, '_topic_preferences', [])
+        return self._topic_preferences
 
     def _matches_topics(self, meeting: dict, topics: list[str]) -> bool:
         """check if meeting matches any user topic interest."""

@@ -99,10 +99,13 @@ class CivicSource(ABC):
     @staticmethod
     def _normalize_response(response):
         """wrap plain-string sdk results so callers can rely on .text/.status_code."""
-        if hasattr(response, "status_code"):
+        try:
+            _ = response.status_code
+            _ = response.text
             return response
-        text = response if isinstance(response, str) else str(response)
-        return _SimpleResponse(text)
+        except AttributeError:
+            text = response if isinstance(response, str) else str(response)
+            return _SimpleResponse(text)
 
     def _http_get(self, url: str, headers: dict = None, timeout: float = None):
         """http get using openhome sdk. timeout is accepted for call-site

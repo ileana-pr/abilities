@@ -72,7 +72,7 @@ The ability logs `LIS_API_KEY resolved successfully` on startup if the key is fo
 - *"Virginia legislature."* → Virginia bills, immediately
 - *"Richmond city."* → Richmond meetings, immediately
 - *"Richmond city council."* → Richmond meetings, immediately
-- *"Town hall."* → *"Which briefing would you like — Virginia General Assembly or Richmond City Council?"*
+- *"Town hall."* → *"Which briefing would you like?"* (user names a jurisdiction)
 - *"Configure topics."* → Interactive topic preference setup for meeting prioritization
 - *"Richmond legislation."* → Fetches and summarizes pending ordinances and resolutions
 - *"Get details on meeting 1."* → Fetches and summarizes specific meeting agenda
@@ -186,16 +186,24 @@ Agent speaks summary
 
 **What happens:**
 
-1. **No keyword match** — The phrase "town hall" contains neither "virginia" nor "richmond"
-2. **Ask which source** — Agent speaks: *"Which briefing would you like — Virginia General Assembly or Richmond City Council?"*
-3. **User responds** — User says: *"Richmond"*
-4. **Route and fetch** — Same flow as Scenario 1 from step 2 onward
+1. **No keyword match** — The phrase "town hall" doesn't name any jurisdiction's trigger keywords
+2. **Ask** — Agent speaks: *"Which briefing would you like?"* (no long menu of sources)
+3. **User responds** — User names a jurisdiction, e.g. *"Richmond"* or *"Virginia"*
+4. **Route and fetch** — If a matching source exists, same flow as Scenario 1; if not, a graceful "I don't have a briefing for that yet" message
 
 **Example conversation:**
 > **User:** "Town hall"  
-> **Agent:** "Which briefing would you like — Virginia General Assembly or Richmond City Council?"  
-> **User:** "Give me Richmond."  
-> **Agent:** "Pulling the latest from Richmond City Council. The Richmond City Council has five upcoming meetings..."
+> **Agent:** "Which briefing would you like?"  
+> **User:** "Richmond."  
+> **Agent:** "Pulling the latest from Richmond City Council..."
+
+**Unavailable source:**
+> **User:** "Town hall"  
+> **Agent:** "Which briefing would you like?"  
+> **User:** "Norfolk."  
+> **Agent:** "I don't have a briefing for that yet. Try naming a supported city, county, state, or federal source..."
+
+Users are expected to know whether their locality is available. As new sources (including federal) ship, the same open-ended question works without changes to `main.py`.
 
 ---
 

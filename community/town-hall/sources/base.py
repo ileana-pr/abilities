@@ -1,5 +1,6 @@
 from abc import ABC, abstractmethod
 from typing import Optional
+import json
 
 
 class _SimpleResponse:
@@ -12,6 +13,9 @@ class _SimpleResponse:
     @property
     def content(self) -> bytes:
         return self.text.encode("utf-8", errors="ignore")
+
+    def json(self):
+        return json.loads(self.text or "{}")
 
 
 class CivicSource(ABC):

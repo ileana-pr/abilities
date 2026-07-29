@@ -1,4 +1,5 @@
 import re
+import json
 from html import unescape
 from typing import Optional
 
@@ -50,7 +51,7 @@ class VirginiaStateSource(CivicSource):
             )
         if resp.status_code >= 400:
             raise RuntimeError(f"session list HTTP {resp.status_code}")
-        data = resp.json() or {}
+        data = json.loads(resp.text or "{}") or {}
         sessions = data.get("Sessions") or []
         session_code, label = 20261, "2026 Regular Session"
         if sessions:
@@ -91,7 +92,7 @@ class VirginiaStateSource(CivicSource):
             return label, []
         if resp.status_code >= 400:
             raise RuntimeError(f"legislation list HTTP {resp.status_code}")
-        payload = resp.json() or {}
+        payload = json.loads(resp.text or "{}") or {}
         bills = payload.get("Legislations") or payload.get("ListItems") or []
         return label, bills
 

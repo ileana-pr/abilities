@@ -1,16 +1,9 @@
 import re
-import io
 import subprocess
 from datetime import datetime, timedelta
 from typing import Optional
 
 from .base import CivicSource
-
-try:
-    from pypdf import PdfReader
-    HAS_PDF_SUPPORT = True
-except ImportError:
-    HAS_PDF_SUPPORT = False
 
 # check for pdftotext utility
 try:
@@ -455,23 +448,7 @@ class RichmondCitySource(CivicSource):
                 except Exception:
                     pass  # fall through to pypdf
             
-            if not pdf_text and HAS_PDF_SUPPORT and resp.content:
-                try:
-                    pdf_file = io.BytesIO(resp.content)
-                    reader = PdfReader(pdf_file)
-                    
-                    # extract text from first few pages
-                    text_parts = []
-                    max_pages = min(5, len(reader.pages))
-                    for page_num in range(max_pages):
-                        page = reader.pages[page_num]
-                        text = page.extract_text()
-                        if text:
-                            text_parts.append(text)
-                    
-                    pdf_text = '\n'.join(text_parts)
-                except Exception:
-                    pass  # no text extracted
+            # rely on pdftotext only - no pypdf fallback
             
             if pdf_text and pdf_text.strip():
                 # extract agenda items based on actual Richmond format

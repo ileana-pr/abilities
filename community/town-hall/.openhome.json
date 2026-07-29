@@ -4,9 +4,15 @@
   "category": "skill",
   "description": "Voice civic briefings from official government sources. Get upcoming Richmond City Council meetings and active Virginia General Assembly legislation summarized for a smart speaker. Built to extend to any city, county, state, or federal body.",
   "trigger_words": [
-    "virginia town hall",
-    "richmond morning briefing",
-    "town hall"
+    "virginia state",
+    "state of virginia",
+    "virginia legislature",
+    "richmond city",
+    "richmond city council",
+    "richmond legislation",
+    "town hall",
+    "configure topics",
+    "set topics"
   ],
   "release_id": 17254,
   "version": "v4",

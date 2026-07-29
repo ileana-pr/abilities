@@ -56,3 +56,4 @@ public/fonts/
 
 # Developer notes (local reference only, not for version control)
 _dev-notes/
+package-lock.json

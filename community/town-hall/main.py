@@ -1,4 +1,5 @@
 import json
+import re
 from datetime import datetime
 from src.agent.capability import MatchingCapability
 from src.main import AgentWorker
@@ -8,6 +9,7 @@ from .sources import discover_sources
 from .sources.base import CivicSource
 
 BRIEFING_FILE = "townhall_briefing.md"
+TOPICS_FILE = "topic_preferences.json"
 
 
 class TownHallCapability(MatchingCapability):
@@ -33,13 +35,42 @@ class TownHallCapability(MatchingCapability):
         )
         return None
 
-    def _bind_sources(self):
-        """attach worker and inject any required api keys for each source."""
+    async def _load_topic_preferences(self) -> dict:
+        """load user's topic preferences from file."""
+        exists = await self.capability_worker.check_if_file_exists(
+            TOPICS_FILE, in_ability_directory=True
+        )
+        if not exists:
+            return {}
+        
+        content = await self.capability_worker.read_file(
+            TOPICS_FILE, in_ability_directory=True
+        )
+        return json.loads(content) if content else {}
+
+    async def _save_topic_preferences(self, preferences: dict) -> None:
+        """save topic preferences to file."""
+        await self.capability_worker.write_file(
+            TOPICS_FILE,
+            json.dumps(preferences, indent=2),
+            in_ability_directory=True
+        )
+
+    async def _bind_sources(self):
+        """inject api keys and topic preferences for each source."""
+        # load topic preferences
+        topic_prefs = await self._load_topic_preferences()
+        
         for source in self.sources:
-            source.bind_worker(self.worker)
             key_name = source.required_api_key_name()
             if key_name:
                 source.set_api_key(self._resolve_api_key(key_name))
+            
+            # inject topic preferences if source supports it
+            if hasattr(source, 'set_topic_preferences'):
+                source_topics = topic_prefs.get(source.get_name(), [])
+                if source_topics:
+                    source.set_topic_preferences(source_topics)
 
     def _match_sources(self, phrase: str) -> list[CivicSource]:
         """sources whose keywords appear in the phrase, plus any that declare none.
@@ -97,7 +128,7 @@ class TownHallCapability(MatchingCapability):
         self, active_sources: list[CivicSource], announce: bool = False
     ) -> str:
         """fetch active sources and refresh the ambient briefing file."""
-        self._bind_sources()
+        await self._bind_sources()
         source_names = ", ".join(s.get_name() for s in active_sources)
         aggregated = [
             f"# TownHall Civic Briefing\n"
@@ -175,10 +206,165 @@ class TownHallCapability(MatchingCapability):
         answer = await self.capability_worker.user_response()
         return self._match_sources(answer) or self.sources
 
+    async def _configure_topics(self, source: CivicSource) -> None:
+        """interactive flow to set user topic preferences."""
+        await self.capability_worker.speak(
+            f"What topics are you interested in for {source.get_name()}? "
+            "You can say housing, zoning, transportation, education, public safety, or budget. "
+            "Say multiple topics separated by 'and'."
+        )
+        
+        response = await self.capability_worker.user_response()
+        
+        # parse topics from response
+        response_lower = response.lower()
+        topics = []
+        for topic in ['housing', 'zoning', 'transportation', 'education', 'public safety', 'budget']:
+            if topic in response_lower:
+                topics.append(topic)
+        
+        if not topics:
+            await self.capability_worker.speak("I didn't catch any topics. Showing all meetings.")
+            return
+        
+        # save preferences
+        prefs = await self._load_topic_preferences()
+        prefs[source.get_name()] = topics
+        await self._save_topic_preferences(prefs)
+        
+        # apply to source
+        if hasattr(source, 'set_topic_preferences'):
+            source.set_topic_preferences(topics)
+        
+        topic_list = ', '.join(topics)
+        await self.capability_worker.speak(
+            f"Got it. I'll prioritize {topic_list} meetings for {source.get_name()}."
+        )
+
+    async def _handle_details_request(self, phrase: str, active_sources: list[CivicSource]) -> bool:
+        """check if this is a details request and handle it. returns True if handled."""
+        # check for legislation request first
+        if 'legislation' in phrase:
+            for source in active_sources:
+                if hasattr(source, 'fetch_legislation'):
+                    await self.capability_worker.speak(f"Fetching pending legislation for {source.get_name()}.")
+                    try:
+                        leg_info = await source.fetch_legislation()
+                        
+                        # summarize for voice
+                        summary = self.capability_worker.text_to_text_response(
+                            "You are summarizing pending legislation. "
+                            "Using ONLY the info below, provide a clear spoken summary. "
+                            "Mention the total count, highlight 3-5 interesting items by topic. "
+                            "Keep it conversational for a smart speaker.\n\n"
+                            f"LEGISLATION INFO:\n{leg_info}"
+                        )
+                        await self.capability_worker.speak(summary)
+                        
+                    except Exception as e:
+                        self.worker.editor_logging_handler.error(f"Legislation fetch error: {e}")
+                        await self.capability_worker.speak(
+                            f"I couldn't fetch legislation details right now. {str(e)[:100]}"
+                        )
+                    
+                    self.capability_worker.resume_normal_flow()
+                    return True
+        
+        # detect meeting details requests
+        details_keywords = ['details', 'detail', 'tell me about', 'about meeting', 'meeting', 'agenda']
+        if not any(kw in phrase for kw in details_keywords):
+            return False
+        
+        # extract meeting reference (number, name, or ID)
+        # patterns: "details on meeting 1", "tell me about city council", "meeting 1354765"
+        meeting_ref = None
+        
+        # try number pattern first: "meeting 1", "number 3", etc.
+        number_match = re.search(r'(?:meeting|number)\s*(\d+)', phrase)
+        if number_match:
+            meeting_ref = number_match.group(1)
+        
+        # try standalone number after "details"
+        if not meeting_ref:
+            standalone_match = re.search(r'details?\s+(?:on|for|about)?\s*(\d+)', phrase)
+            if standalone_match:
+                meeting_ref = standalone_match.group(1)
+        
+        # try body name extraction: "about city council", "planning commission"
+        if not meeting_ref:
+            # remove trigger words and common phrases
+            cleaned = re.sub(r'(tell me about|details? (?:on|for|about)|meeting|the)\s*', '', phrase, flags=re.IGNORECASE)
+            if cleaned.strip() and len(cleaned.strip()) > 3:
+                meeting_ref = cleaned.strip()
+        
+        if not meeting_ref:
+            await self.capability_worker.speak(
+                "I didn't catch which meeting you want details for. Try saying the meeting number like 'details on meeting 1'."
+            )
+            self.capability_worker.resume_normal_flow()
+            return True
+        
+        # route to source's get_details
+        for source in active_sources:
+            if hasattr(source, 'get_details'):
+                await self.capability_worker.speak(f"Fetching details for {source.get_name()}.")
+                try:
+                    details = await source.get_details(meeting_ref)
+                    
+                    # summarize the details for voice
+                    summary = self.capability_worker.text_to_text_response(
+                        "You are summarizing a civic meeting agenda. "
+                        "Using ONLY the details below, provide a clear spoken summary. "
+                        "Mention the meeting name, date, time, and 3-5 key agenda items. "
+                        "Keep it conversational for a smart speaker.\n\n"
+                        f"MEETING DETAILS:\n{details}"
+                    )
+                    await self.capability_worker.speak(summary)
+                    
+                except Exception as e:
+                    self.worker.editor_logging_handler.error(f"Details fetch error: {e}")
+                    await self.capability_worker.speak(
+                        f"I couldn't fetch those details right now. {str(e)[:100]}"
+                    )
+                
+                self.capability_worker.resume_normal_flow()
+                return True
+        
+        await self.capability_worker.speak("Details are not available for this source yet.")
+        self.capability_worker.resume_normal_flow()
+        return True
+
+
     async def run(self):
         active_sources = await self._choose_sources()
+        
+        # check if user wants to configure topics (on first time or explicit request)
+        phrase = await self._capture_trigger_phrase()
+        
+        # handle details requests
+        if await self._handle_details_request(phrase, active_sources):
+            return
+        
+        # handle topic configuration
+        if 'configure' in phrase or 'set topics' in phrase:
+            for source in active_sources:
+                if hasattr(source, 'set_topic_preferences'):
+                    await self._configure_topics(source)
+            self.capability_worker.resume_normal_flow()
+            return
+        
+        # ask if user wants to configure topics (first time only)
+        prefs = await self._load_topic_preferences()
+        for source in active_sources:
+            if source.get_name() not in prefs and hasattr(source, 'set_topic_preferences'):
+                await self.capability_worker.speak(
+                    "Would you like to set topic preferences to prioritize certain meetings?"
+                )
+                response = await self.capability_worker.user_response()
+                if 'yes' in response.lower():
+                    await self._configure_topics(source)
+        
         source_names = ", ".join(s.get_name() for s in active_sources)
-
         await self.capability_worker.speak(f"Pulling the latest from {source_names}.")
         try:
             briefing = await self.read_cached_briefing(active_sources)
@@ -221,6 +407,6 @@ class TownHallCapability(MatchingCapability):
         self.worker = worker
         self.capability_worker = CapabilityWorker(self.worker)
         self.sources = discover_sources()
-        self._bind_sources()
+        # note: _bind_sources is now async and called in collect_briefing
         self.worker.session_tasks.create(self.watchdog_loop())
         self.worker.session_tasks.create(self.run())

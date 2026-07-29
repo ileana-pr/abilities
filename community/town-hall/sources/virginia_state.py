@@ -31,9 +31,9 @@ class VirginiaStateSource(CivicSource):
             "User-Agent": "OpenHome-TownHall/1.0",
         }
 
-    async def _fetch_via_api(self, api_key: str) -> tuple[str, list[dict]]:
+    def _fetch_via_api(self, api_key: str) -> tuple[str, list[dict]]:
         url = f"{LIS_BASE}/Session/api/getsessionlistasync"
-        resp = await self._http_get(url, headers=self._headers(api_key), timeout=REQUEST_TIMEOUT)
+        resp = self._http_get(url, headers=self._headers(api_key), timeout=REQUEST_TIMEOUT)
         if resp.status_code in (401, 403):
             raise RuntimeError(
                 f"LIS API key rejected (HTTP {resp.status_code}) — verify LIS_API_KEY in Settings"
@@ -74,7 +74,7 @@ class VirginiaStateSource(CivicSource):
             f"{LIS_BASE}/Legislation/api/getlegislationsessionlistasync"
             f"?SessionCode={session_code}"
         )
-        resp = await self._http_get(
+        resp = self._http_get(
             list_url, headers=self._headers(api_key), timeout=REQUEST_TIMEOUT
         )
         if resp.status_code == 204 or not resp.text:
@@ -204,7 +204,7 @@ class VirginiaStateSource(CivicSource):
             )
 
         try:
-            label, bills = await self._fetch_via_api(api_key)
+            label, bills = self._fetch_via_api(api_key)
         except Exception as e:
             return (
                 f"### Virginia General Assembly\n"

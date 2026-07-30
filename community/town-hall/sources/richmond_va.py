@@ -35,7 +35,8 @@ class RichmondCitySource(CivicSource):
         return "https://richmondva.legistar.com/Calendar.aspx"
 
     def trigger_keywords(self) -> tuple[str, ...]:
-        return ("richmond", "legislation")
+        # jurisdiction only — "legislation" is handled as an intent in main.py
+        return ("richmond",)
 
     def set_topic_preferences(self, topics: list[str]) -> None:
         """store user's topic interests."""

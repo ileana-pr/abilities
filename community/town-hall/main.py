@@ -397,7 +397,7 @@ class TownHallCapability(MatchingCapability):
             )
 
     def _is_done_intent(self, phrase: str) -> bool:
-        """true when the user wants to end the follow-up loop."""
+        """true when the user declines details or wants to end."""
         text = (phrase or "").lower().strip()
         if not text:
             return True
@@ -416,14 +416,25 @@ class TownHallCapability(MatchingCapability):
             "never mind",
             "nevermind",
             "no",
+            "nope",
+            "nah",
         )
         return any(p == text or text.startswith(p + " ") for p in done_phrases) or text in done_phrases
+
+    def _is_affirmative(self, phrase: str) -> bool:
+        text = (phrase or "").lower().strip()
+        if not text:
+            return False
+        yes_words = ("yes", "yeah", "yep", "sure", "please", "ok", "okay", "affirmative")
+        return text in yes_words or any(text.startswith(w + " ") for w in yes_words)
 
     def _is_legislation_intent(self, phrase: str) -> bool:
         """true for a full legislation list request (not a specific item lookup)."""
         text = (phrase or "").lower().strip()
         # specific file numbers are details, not a full list
         if re.search(r'\b(ord\.?|res\.?)\s*\d', text):
+            return False
+        if re.search(r'\b([hs]b)\s*\d+\b', text):
             return False
         list_markers = (
             "legislation",
@@ -452,6 +463,8 @@ class TownHallCapability(MatchingCapability):
         text = (phrase or "").lower()
         if re.search(r'\b(ord\.?|res\.?)\s*\d', text):
             return True
+        if re.search(r'\b([hs]b)\s*\d+\b', text):
+            return True
         details_keywords = (
             'details', 'detail', 'tell me about', 'about meeting',
             'meeting', 'agenda', 'more about', 'what about',
@@ -466,38 +479,25 @@ class TownHallCapability(MatchingCapability):
     async def _handle_legislation_request(
         self,
         active_sources: list[CivicSource],
-        briefing: str = "",
         end_session: bool = True,
     ) -> bool:
         """fetch and speak legislation for active sources. returns True if handled."""
+        await self._bind_sources()
         for source in active_sources:
             await self.capability_worker.speak(
                 f"Fetching pending legislation for {source.get_name()}."
             )
             try:
                 leg_info = await source.fetch_legislation()
-
-                # virginia (and others without a legislation endpoint) already
-                # put bills in the briefing — answer from that instead of the stub
-                if briefing and "not available" in leg_info.lower():
-                    summary = self.capability_worker.text_to_text_response(
-                        "You are answering a follow-up about legislation from a civic briefing. "
-                        "Using ONLY the briefing text below, highlight the most relevant bills "
-                        "or legislation items in 3-5 short sentences. Prefer items matching "
-                        "common civic topics if present. Speak plainly for a smart speaker.\n\n"
-                        f"USER ASKED ABOUT: legislation\n\nBRIEFING TEXT:\n{briefing}"
-                    )
-                    await self.capability_worker.speak(summary)
-                else:
-                    summary = self.capability_worker.text_to_text_response(
-                        "You are summarizing pending legislation. "
-                        "Using ONLY the info below, provide a clear spoken summary. "
-                        "Mention the total count, lead with any items marked as matching "
-                        "the user's topics, then highlight 3-5 interesting items. "
-                        "Keep it conversational for a smart speaker.\n\n"
-                        f"LEGISLATION INFO:\n{leg_info}"
-                    )
-                    await self.capability_worker.speak(summary)
+                summary = self.capability_worker.text_to_text_response(
+                    "You are summarizing pending legislation. "
+                    "Using ONLY the info below, provide a clear spoken summary. "
+                    "Mention the total count, lead with any items marked as matching "
+                    "the user's topics, then highlight 3-5 interesting items. "
+                    "Keep it conversational for a smart speaker.\n\n"
+                    f"LEGISLATION INFO:\n{leg_info}"
+                )
+                await self.capability_worker.speak(summary)
 
             except Exception as e:
                 self.worker.editor_logging_handler.error(f"Legislation fetch error: {e}")
@@ -516,7 +516,6 @@ class TownHallCapability(MatchingCapability):
         end_session: bool = True,
     ) -> bool:
         """handle meeting / item detail requests. returns True if handled."""
-        # extract meeting reference (number, name, ID, or legislation search terms)
         meeting_ref = None
 
         number_match = re.search(r'(?:meeting|number)\s*(\d+)', phrase)
@@ -529,7 +528,6 @@ class TownHallCapability(MatchingCapability):
                 meeting_ref = standalone_match.group(1)
 
         if not meeting_ref:
-            # ord/res ids or body/topic phrases
             cleaned = re.sub(
                 r'(tell me about|details? (?:on|for|about)|meeting|more about|what about|the)\s*',
                 '',
@@ -547,6 +545,7 @@ class TownHallCapability(MatchingCapability):
             await self._speak_and_maybe_end(end_session)
             return True
 
+        await self._bind_sources()
         for source in active_sources:
             await self.capability_worker.speak(f"Fetching details for {source.get_name()}.")
             try:
@@ -572,85 +571,54 @@ class TownHallCapability(MatchingCapability):
 
         return True
 
-    async def _handle_details_request(
-        self,
-        phrase: str,
-        active_sources: list[CivicSource],
-        briefing: str = "",
-        end_session: bool = True,
-    ) -> bool:
-        """check if this is a details/legislation request and handle it. returns True if handled."""
-        if self._is_legislation_intent(phrase):
-            return await self._handle_legislation_request(
-                active_sources, briefing=briefing, end_session=end_session
+    async def _offer_details_once(
+        self, active_sources: list[CivicSource], mode: str
+    ) -> None:
+        """one optional details listen after a briefing or legislation list, then exit."""
+        if mode == "legislation":
+            await self.capability_worker.speak(
+                "Want details on a specific item? "
+                "Say the bill or ordinance name, or say no."
+            )
+        else:
+            await self.capability_worker.speak(
+                "Would you like details on a meeting? "
+                "Say the meeting number, or say no."
             )
 
-        if not self._is_details_intent(phrase):
-            return False
+        answer = await self.capability_worker.user_response()
+        answer = (answer or "").strip()
 
-        return await self._handle_meeting_details(
-            phrase, active_sources, end_session=end_session
-        )
+        if self._is_done_intent(answer):
+            await self.capability_worker.speak("Okay.")
+            self.capability_worker.resume_normal_flow()
+            return
 
-    async def _answer_from_briefing(self, question: str, briefing: str) -> None:
-        """answer a free-form follow-up using only the briefing already fetched."""
-        summary = self.capability_worker.text_to_text_response(
-            "You are answering a follow-up question about a civic briefing the user just heard. "
-            "Using ONLY the briefing text below, answer in 2-4 short sentences. "
-            "If the briefing does not contain the answer, say you don't have that detail "
-            "in the current briefing and suggest asking about a meeting number or legislation. "
-            "Do not invent facts. Speak plainly for a smart speaker.\n\n"
-            f"USER QUESTION:\n{question}\n\nBRIEFING TEXT:\n{briefing}"
-        )
-        await self.capability_worker.speak(summary)
-
-    async def _follow_up_loop(
-        self, active_sources: list[CivicSource], briefing: str
-    ) -> None:
-        """after a briefing, allow a few turns of legislation / details / Q&A."""
-        await self.capability_worker.speak(
-            "Want details on a meeting, recent legislation, or something else from that briefing? "
-            "Or say you're done."
-        )
-
-        for _ in range(3):
+        if self._is_affirmative(answer):
+            if mode == "legislation":
+                await self.capability_worker.speak(
+                    "Which bill or ordinance? Say the name or number."
+                )
+            else:
+                await self.capability_worker.speak(
+                    "Which meeting number should I look up?"
+                )
             answer = await self.capability_worker.user_response()
             answer = (answer or "").strip()
-
             if self._is_done_intent(answer):
                 await self.capability_worker.speak("Okay.")
-                break
+                self.capability_worker.resume_normal_flow()
+                return
 
-            if self._is_legislation_intent(answer):
-                await self._handle_legislation_request(
-                    active_sources, briefing=briefing, end_session=False
-                )
-                await self.capability_worker.speak(
-                    "Anything else, or are you done?"
-                )
-                continue
-
-            if self._is_details_intent(answer):
-                await self._handle_meeting_details(
-                    answer, active_sources, end_session=False
-                )
-                await self.capability_worker.speak(
-                    "Anything else, or are you done?"
-                )
-                continue
-
-            # free-form question about what was just presented
-            await self._answer_from_briefing(answer, briefing)
-            await self.capability_worker.speak(
-                "Anything else, or are you done?"
-            )
-
+        await self._handle_meeting_details(
+            answer, active_sources, end_session=False
+        )
         self.capability_worker.resume_normal_flow()
 
     async def run(self):
         phrase = await self._capture_trigger_phrase()
 
-        # topic config is user-level — no jurisdiction needed
+        # topic config is user-level — trigger words only
         if 'configure' in phrase or 'set topics' in phrase:
             await self._configure_topics()
             self.capability_worker.resume_normal_flow()
@@ -671,19 +639,16 @@ class TownHallCapability(MatchingCapability):
             self.capability_worker.resume_normal_flow()
             return
 
-        # dedicated details/legislation triggers (no follow-up loop)
-        if await self._handle_details_request(phrase, active_sources, end_session=True):
+        # legislation list + one details offer
+        if self._is_legislation_intent(phrase):
+            await self._handle_legislation_request(active_sources, end_session=False)
+            await self._offer_details_once(active_sources, mode="legislation")
             return
 
-        # offer topic setup once if the user has none yet
-        topics = await self._load_topic_preferences()
-        if not topics:
-            await self.capability_worker.speak(
-                "Would you like to set topic preferences to prioritize certain meetings?"
-            )
-            response = await self.capability_worker.user_response()
-            if 'yes' in response.lower():
-                await self._configure_topics()
+        # dedicated item details (meeting number / ord / bill id)
+        if self._is_details_intent(phrase):
+            await self._handle_meeting_details(phrase, active_sources, end_session=True)
+            return
 
         source_names = ", ".join(s.get_name() for s in active_sources)
         await self.capability_worker.speak(f"Pulling the latest from {source_names}.")
@@ -719,7 +684,7 @@ class TownHallCapability(MatchingCapability):
             if not source.validate_cache(briefing):
                 await self.log_gap(source.get_name(), "Source returned no usable data.")
 
-        await self._follow_up_loop(active_sources, briefing)
+        await self._offer_details_once(active_sources, mode="meeting")
 
     def call(self, worker: AgentWorker):
         self.worker = worker

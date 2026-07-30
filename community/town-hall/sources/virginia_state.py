@@ -1,5 +1,4 @@
 import csv
-import io
 import json
 import re
 from datetime import datetime, timedelta
@@ -432,7 +431,8 @@ class VirginiaStateSource(CivicSource):
         raise RuntimeError(f"BILLS.CSV fallback failed: {last_error}")
 
     def _parse_bills_csv(self, text: str) -> list[dict]:
-        reader = csv.DictReader(io.StringIO(text))
+        # DictReader accepts an iterable of lines — avoid import io (cloud-blocked)
+        reader = csv.DictReader((text or "").splitlines())
         bills = []
         for row in reader:
             bill_id = (row.get("Bill_id") or "").strip()

@@ -6,13 +6,13 @@ import json
 class _SimpleResponse:
     """minimal response wrapper for sdk results that are plain strings."""
 
-    def __init__(self, text: str):
+    def __init__(self, text: str, status_code: int = 200):
         self.text = text
-        self.status_code = 200
+        self.status_code = status_code
 
     @property
     def content(self) -> bytes:
-        return self.text.encode("utf-8", errors="ignore")
+        return (self.text or "").encode("utf-8", errors="ignore")
 
     def json(self):
         return json.loads(self.text or "{}")
@@ -39,26 +39,45 @@ class CivicSource(ABC):
         return an empty tuple to always include this source regardless of trigger."""
         return ()
 
+    @staticmethod
+    def extract_section(content: str, name: str) -> str | None:
+        """return the ### {name} section only (exact heading line, not a prefix)."""
+        if not content or not name:
+            return None
+        heading = f"### {name}"
+        lines = content.splitlines(keepends=True)
+        start = None
+        for i, line in enumerate(lines):
+            if line.strip() == heading:
+                start = i
+                break
+        if start is None:
+            return None
+        end = len(lines)
+        for j in range(start + 1, len(lines)):
+            stripped = lines[j].strip()
+            if stripped == "---" or stripped.startswith("### "):
+                end = j
+                break
+        return "".join(lines[start:end])
+
     def validate_cache(self, content: str) -> bool:
-        """return False if this source's section in the aggregated briefing looks errored.
-        the coordinator uses this to decide whether to serve or discard a cached briefing."""
-        name = self.get_name()
-        marker = f"### {name}"
-        if marker not in content:
-            return True
-        start = content.index(marker)
-        end = content.find("---", start)
-        section = content[start:end] if end != -1 else content[start:]
+        """return False if this source's section is missing or contains an error."""
+        section = self.extract_section(content, self.get_name())
+        if not section:
+            return False
         data_lines = [
             l.strip() for l in section.split("\n")
             if l.strip() and not l.strip().startswith("#")
         ]
         if not data_lines:
             return False
-        return not all(
-            l.lower().startswith("- error") or l.lower().startswith("error")
-            for l in data_lines
-        )
+        for line in data_lines:
+            lowered = line.lower()
+            if lowered.startswith("- error") or lowered.startswith("error"):
+                return False
+        return True
+
 
     @abstractmethod
     def get_name(self) -> str:
@@ -102,14 +121,45 @@ class CivicSource(ABC):
 
     @staticmethod
     def _normalize_response(response):
-        """wrap plain-string sdk results so callers can rely on .text/.status_code."""
+        """wrap sdk results so callers can rely on .text/.status_code."""
+        if response is None:
+            return _SimpleResponse("", status_code=502)
+
+        if isinstance(response, dict):
+            text = response.get("text") or response.get("body") or response.get("content") or ""
+            if isinstance(text, bytes):
+                text = text.decode("utf-8", errors="ignore")
+            status = int(response.get("status_code") or response.get("status") or 200)
+            return _SimpleResponse(str(text), status_code=status)
+
+        if isinstance(response, (bytes, bytearray)):
+            return _SimpleResponse(response.decode("utf-8", errors="ignore"), status_code=200)
+
+        # response-like object from the sdk (duck-typed without getattr)
         try:
-            _ = response.status_code
-            _ = response.text
-            return response
-        except AttributeError:
-            text = response if isinstance(response, str) else str(response)
-            return _SimpleResponse(text)
+            status = int(response.status_code or 200)
+            text = response.text
+            if text is None:
+                content = response.content
+                if isinstance(content, bytes):
+                    text = content.decode("utf-8", errors="ignore")
+                else:
+                    text = str(content or "")
+            return _SimpleResponse(text or "", status_code=status)
+        except Exception:
+            pass
+
+        text = response if isinstance(response, str) else str(response)
+        lowered = (text or "").lower()
+        if (
+            not text.strip()
+            or text.startswith("coroutine ")
+            or "traceback" in lowered
+            or lowered.startswith("error")
+            or "failed" in lowered[:100]
+        ):
+            return _SimpleResponse(text, status_code=502)
+        return _SimpleResponse(text, status_code=200)
 
     def _http_get(self, url: str, headers: dict = None, timeout: float = None):
         """http get using openhome sdk. timeout is accepted for call-site
@@ -123,5 +173,7 @@ class CivicSource(ABC):
         """http post using openhome sdk."""
         if not self._worker:
             raise RuntimeError("worker not bound - call bind_worker() first")
-        response = self._worker.session_tasks.post(url, headers=headers or {}, json=json_body)
+        response = self._worker.session_tasks.post(
+            url, headers=headers or {}, json=json_body
+        )
         return self._normalize_response(response)

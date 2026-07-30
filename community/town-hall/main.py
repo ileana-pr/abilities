@@ -126,7 +126,7 @@ class TownHallCapability(MatchingCapability):
         )
 
     async def read_cached_briefing(self, active_sources: list[CivicSource]) -> str | None:
-        """return a usable cached briefing if present and all active sources validate it."""
+        """return cached sections for active sources only, if all validate."""
         exists = await self.capability_worker.check_if_file_exists(
             BRIEFING_FILE, in_ability_directory=False
         )
@@ -142,7 +142,15 @@ class TownHallCapability(MatchingCapability):
             return None
         if not all(source.validate_cache(content) for source in active_sources):
             return None
-        return content
+        # only serve the active source sections — never a sibling source's errors
+        sections = []
+        for source in active_sources:
+            section = CivicSource.extract_section(content, source.get_name())
+            if section:
+                sections.append(section.strip())
+        if not sections:
+            return None
+        return "\n\n---\n\n".join(sections)
 
     async def collect_briefing(
         self, active_sources: list[CivicSource], announce: bool = False
@@ -165,7 +173,9 @@ class TownHallCapability(MatchingCapability):
             )
             aggregated.append(updates)
         final_context = "\n\n---\n\n".join(aggregated)
-        await self.write_context_file(BRIEFING_FILE, final_context)
+        # only persist when at least one active source returned usable data
+        if any(source.validate_cache(final_context) for source in active_sources):
+            await self.write_context_file(BRIEFING_FILE, final_context)
         self.worker.editor_logging_handler.info(
             f"Briefing ready ({len(final_context)} chars): {final_context[:400]}"
         )
@@ -178,16 +188,130 @@ class TownHallCapability(MatchingCapability):
         stop = {"done": False}
 
         async def _keepalive():
+            # first ping after 12s — avoid extra chat turns on fast fetches
+            await self.worker.session_tasks.sleep(12.0)
             while not stop["done"]:
-                await self.worker.session_tasks.sleep(10.0)
-                if not stop["done"]:
-                    await self.capability_worker.speak("Still pulling updates.")
+                await self.capability_worker.speak("Still pulling updates.")
+                await self.worker.session_tasks.sleep(15.0)
 
         self.worker.session_tasks.create(_keepalive())
         try:
-            return await self.collect_briefing(active_sources, announce=True)
+            return await self.collect_briefing(active_sources, announce=False)
         finally:
             stop["done"] = True
+
+    def _active_briefing_text(
+        self, text: str, active_sources: list[CivicSource]
+    ) -> str:
+        """limit error checks to the active source sections."""
+        parts = []
+        for source in active_sources:
+            section = CivicSource.extract_section(text, source.get_name())
+            if section:
+                parts.append(section)
+        return "\n".join(parts) if parts else (text or "")
+
+    def _briefing_failed(
+        self, text: str, active_sources: list[CivicSource] | None = None
+    ) -> bool:
+        """true when active source sections are empty or errored."""
+        scoped = (
+            self._active_briefing_text(text, active_sources)
+            if active_sources
+            else (text or "")
+        )
+        if not scoped.strip():
+            return True
+        for line in scoped.splitlines():
+            lowered = line.strip().lower()
+            if lowered.startswith("- error") or lowered.startswith("error"):
+                return True
+        if active_sources and not all(
+            source.validate_cache(scoped) for source in active_sources
+        ):
+            return True
+        return False
+
+    def _error_snip(
+        self, text: str, active_sources: list[CivicSource] | None = None
+    ) -> str:
+        scoped = (
+            self._active_briefing_text(text, active_sources)
+            if active_sources
+            else (text or "")
+        )
+        for line in scoped.splitlines():
+            lowered = line.strip().lower()
+            if lowered.startswith("- error") or "error fetching" in lowered:
+                return line.strip(" -")[:160]
+        return ""
+
+    def _data_source_label(self, text: str) -> str:
+        """pull the '- Data source: ...' line so we can speak it reliably."""
+        for line in (text or "").splitlines():
+            stripped = line.strip()
+            if stripped.lower().startswith("- data source:"):
+                return stripped.split(":", 1)[1].strip()
+        return ""
+
+    def _with_data_source(self, spoken: str, raw: str) -> str:
+        label = self._data_source_label(raw)
+        if not label:
+            return spoken
+        self.worker.editor_logging_handler.info(f"TownHall data source: {label}")
+        # spoken attribution — which virginia feed was used
+        return f"{spoken.rstrip()} Data source: {label}."
+
+    def _details_prompt(self, mode: str) -> str:
+        if mode == "legislation":
+            return (
+                "Want details on a specific item? "
+                "Say the bill or ordinance name, or say no."
+            )
+        return (
+            "Would you like details on a meeting? "
+            "Say the meeting number, or say no."
+        )
+
+    async def _offer_details_once(
+        self,
+        active_sources: list[CivicSource],
+        mode: str,
+        preamble: str | None = None,
+    ) -> None:
+        """speak optional preamble + details question in one turn, then listen once."""
+        prompt = self._details_prompt(mode)
+        spoken = f"{preamble.strip()} {prompt}" if preamble else prompt
+        await self.capability_worker.speak(spoken)
+
+        answer = await self.capability_worker.user_response()
+        answer = (answer or "").strip()
+
+        if self._is_done_intent(answer):
+            await self.capability_worker.speak("Okay.")
+            self.capability_worker.resume_normal_flow()
+            return
+
+        if self._is_affirmative(answer):
+            if mode == "legislation":
+                await self.capability_worker.speak(
+                    "Which bill or ordinance? Say the name or number."
+                )
+            else:
+                await self.capability_worker.speak(
+                    "Which meeting number should I look up?"
+                )
+            answer = await self.capability_worker.user_response()
+            answer = (answer or "").strip()
+            if self._is_done_intent(answer):
+                await self.capability_worker.speak("Okay.")
+                self.capability_worker.resume_normal_flow()
+                return
+
+        await self._handle_meeting_details(
+            answer, active_sources, end_session=False
+        )
+        self.capability_worker.resume_normal_flow()
 
     async def watchdog_loop(self):
         """warm cache quickly, then refresh daily."""
@@ -479,35 +603,45 @@ class TownHallCapability(MatchingCapability):
     async def _handle_legislation_request(
         self,
         active_sources: list[CivicSource],
-        end_session: bool = True,
-    ) -> bool:
-        """fetch and speak legislation for active sources. returns True if handled."""
+    ) -> str | None:
+        """fetch legislation and return a spoken summary, or speak an error and return None."""
         await self._bind_sources()
         for source in active_sources:
-            await self.capability_worker.speak(
-                f"Fetching pending legislation for {source.get_name()}."
-            )
             try:
                 leg_info = await source.fetch_legislation()
-                summary = self.capability_worker.text_to_text_response(
+            except Exception as e:
+                self.worker.editor_logging_handler.error(f"Legislation fetch error: {e}")
+                await self.capability_worker.speak(
+                    f"I couldn't fetch legislation for {source.get_name()} right now."
+                )
+                return None
+
+            if self._briefing_failed(leg_info):
+                snip = self._error_snip(leg_info)
+                msg = (
+                    f"I couldn't reach legislation data for {source.get_name()} right now."
+                )
+                if snip:
+                    msg = f"{msg} {snip}."
+                await self.capability_worker.speak(msg)
+                await self.log_gap(source.get_name(), "Legislation fetch returned error.")
+                return None
+
+            return self._with_data_source(
+                self.capability_worker.text_to_text_response(
                     "You are summarizing pending legislation. "
                     "Using ONLY the info below, provide a clear spoken summary. "
                     "Mention the total count, lead with any items marked as matching "
                     "the user's topics, then highlight 3-5 interesting items. "
+                    "If there are no items, say that clearly. "
+                    "Do not invent access problems when the list is simply empty. "
+                    "Do not mention the data source line — it is added separately. "
                     "Keep it conversational for a smart speaker.\n\n"
                     f"LEGISLATION INFO:\n{leg_info}"
-                )
-                await self.capability_worker.speak(summary)
-
-            except Exception as e:
-                self.worker.editor_logging_handler.error(f"Legislation fetch error: {e}")
-                await self.capability_worker.speak(
-                    f"I couldn't fetch legislation details right now. {str(e)[:100]}"
-                )
-
-            await self._speak_and_maybe_end(end_session)
-            return True
-        return False
+                ),
+                leg_info,
+            )
+        return None
 
     async def _handle_meeting_details(
         self,
@@ -547,7 +681,6 @@ class TownHallCapability(MatchingCapability):
 
         await self._bind_sources()
         for source in active_sources:
-            await self.capability_worker.speak(f"Fetching details for {source.get_name()}.")
             try:
                 details = await source.get_details(meeting_ref)
 
@@ -570,50 +703,6 @@ class TownHallCapability(MatchingCapability):
             return True
 
         return True
-
-    async def _offer_details_once(
-        self, active_sources: list[CivicSource], mode: str
-    ) -> None:
-        """one optional details listen after a briefing or legislation list, then exit."""
-        if mode == "legislation":
-            await self.capability_worker.speak(
-                "Want details on a specific item? "
-                "Say the bill or ordinance name, or say no."
-            )
-        else:
-            await self.capability_worker.speak(
-                "Would you like details on a meeting? "
-                "Say the meeting number, or say no."
-            )
-
-        answer = await self.capability_worker.user_response()
-        answer = (answer or "").strip()
-
-        if self._is_done_intent(answer):
-            await self.capability_worker.speak("Okay.")
-            self.capability_worker.resume_normal_flow()
-            return
-
-        if self._is_affirmative(answer):
-            if mode == "legislation":
-                await self.capability_worker.speak(
-                    "Which bill or ordinance? Say the name or number."
-                )
-            else:
-                await self.capability_worker.speak(
-                    "Which meeting number should I look up?"
-                )
-            answer = await self.capability_worker.user_response()
-            answer = (answer or "").strip()
-            if self._is_done_intent(answer):
-                await self.capability_worker.speak("Okay.")
-                self.capability_worker.resume_normal_flow()
-                return
-
-        await self._handle_meeting_details(
-            answer, active_sources, end_session=False
-        )
-        self.capability_worker.resume_normal_flow()
 
     async def run(self):
         phrase = await self._capture_trigger_phrase()
@@ -639,10 +728,15 @@ class TownHallCapability(MatchingCapability):
             self.capability_worker.resume_normal_flow()
             return
 
-        # legislation list + one details offer
+        # legislation list + one combined speak (summary + details offer)
         if self._is_legislation_intent(phrase):
-            await self._handle_legislation_request(active_sources, end_session=False)
-            await self._offer_details_once(active_sources, mode="legislation")
+            summary = await self._handle_legislation_request(active_sources)
+            if summary:
+                await self._offer_details_once(
+                    active_sources, mode="legislation", preamble=summary
+                )
+            else:
+                self.capability_worker.resume_normal_flow()
             return
 
         # dedicated item details (meeting number / ord / bill id)
@@ -651,7 +745,6 @@ class TownHallCapability(MatchingCapability):
             return
 
         source_names = ", ".join(s.get_name() for s in active_sources)
-        await self.capability_worker.speak(f"Pulling the latest from {source_names}.")
         try:
             briefing = await self.read_cached_briefing(active_sources)
             if briefing:
@@ -668,23 +761,42 @@ class TownHallCapability(MatchingCapability):
             self.capability_worker.resume_normal_flow()
             return
 
-        summary = self.capability_worker.text_to_text_response(
-            "You are giving a short spoken civic briefing. "
-            f"Using ONLY the briefing text below, summarize the most important "
-            f"updates from {source_names} in 4 to 6 short sentences. "
-            "Do not mention documents, databases, or missing context. "
-            "If a section contains an error, say briefly that the source was "
-            "unavailable, then cover whatever else is there. "
-            "Speak plainly for a smart speaker.\n\n"
-            f"BRIEFING TEXT:\n{briefing}"
+        if self._briefing_failed(briefing, active_sources):
+            snip = self._error_snip(briefing, active_sources)
+            msg = f"I couldn't reach the meetings calendar for {source_names} right now."
+            if snip:
+                msg = f"{msg} {snip}."
+            await self.capability_worker.speak(msg)
+            for source in active_sources:
+                await self.log_gap(source.get_name(), "Source returned no usable data.")
+            self.capability_worker.resume_normal_flow()
+            return
+
+        summary = self._with_data_source(
+            self.capability_worker.text_to_text_response(
+                "You are giving a short spoken briefing about upcoming meetings only. "
+                f"Using ONLY the briefing text below, summarize the meeting schedule "
+                f"from {source_names} in 3 to 5 short sentences. "
+                "Name committees or bodies and dates/times when present. "
+                "If there are no upcoming meetings, say that clearly. "
+                "If a section contains an error, say the meetings calendar was "
+                "unavailable — do not invent a legislation or bills problem. "
+                "Ignore any lines that only tell the listener what to say next. "
+                "Do not mention the data source line — it is added separately. "
+                "Do not mention documents, databases, or missing context. "
+                "Speak plainly for a smart speaker.\n\n"
+                f"BRIEFING TEXT:\n{briefing}"
+            ),
+            briefing,
         )
-        await self.capability_worker.speak(summary)
 
         for source in active_sources:
             if not source.validate_cache(briefing):
                 await self.log_gap(source.get_name(), "Source returned no usable data.")
 
-        await self._offer_details_once(active_sources, mode="meeting")
+        await self._offer_details_once(
+            active_sources, mode="meeting", preamble=summary
+        )
 
     def call(self, worker: AgentWorker):
         self.worker = worker

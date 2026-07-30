@@ -241,6 +241,7 @@ class VirginiaStateSource(CivicSource):
             timeout=REQUEST_TIMEOUT,
         )
         if resp.status_code in (401, 403):
+            self._api_key = None
             raise RuntimeError(f"schedule API key rejected (HTTP {resp.status_code})")
         if resp.status_code >= 400:
             raise RuntimeError(f"schedule list HTTP {resp.status_code}")
@@ -266,13 +267,12 @@ class VirginiaStateSource(CivicSource):
         return meetings
 
     def _fetch_meetings_via_ics(self) -> list[dict]:
-        resp = self._http_get(
-            ICS_URL,
-            headers={"User-Agent": "OpenHome-TownHall/1.0", "Accept": "text/calendar"},
-            timeout=REQUEST_TIMEOUT,
-        )
+        resp = self._http_get(ICS_URL, timeout=REQUEST_TIMEOUT)
         if resp.status_code >= 400 or not resp.text:
-            raise RuntimeError(f"ICS fetch HTTP {resp.status_code or 'empty'}")
+            body = (resp.text or "")[:120].replace("\n", " ")
+            raise RuntimeError(
+                f"ICS fetch HTTP {resp.status_code or 'empty'}: {body}"
+            )
         return self._parse_ics(resp.text)
 
     @staticmethod
@@ -329,15 +329,17 @@ class VirginiaStateSource(CivicSource):
         if api_key:
             try:
                 meetings = self._fetch_meetings_via_api(api_key)
-                source_note = "LIS Schedule API"
+                source_note = "Virginia schedule"
             except Exception as e:
-                source_note = f"Schedule API unavailable ({e}); using ICS"
+                if self._worker:
+                    self._worker.editor_logging_handler.warning(
+                        f"Virginia schedule API: {e}"
+                    )
 
         if not meetings:
             try:
                 meetings = self._fetch_meetings_via_ics()
-                if not source_note:
-                    source_note = "LIS ICS calendar"
+                source_note = "Virginia calendar"
             except Exception as e:
                 return (
                     "### Virginia General Assembly\n"
@@ -351,12 +353,10 @@ class VirginiaStateSource(CivicSource):
 
         if not upcoming:
             lines.append(
-                f"- No upcoming committee or legislative meetings in the next {MEETING_DAYS_AHEAD} days"
+                f"- No upcoming committee or floor meetings in the next {MEETING_DAYS_AHEAD} days"
             )
-            lines.append(f"- Source: {self.get_source_url()} ({source_note})")
-            lines.append(
-                "\nSay 'virginia legislation' for active bills and resolutions"
-            )
+            lines.append(f"- Data source: {source_note}")
+            lines.append(f"- Source: {self.get_source_url()}")
             return "\n".join(lines)
 
         display = upcoming[:MAX_MEETINGS]
@@ -370,10 +370,7 @@ class VirginiaStateSource(CivicSource):
         lines.append(
             "\nSay 'details on meeting [number]' or 'tell me about [committee name]'"
         )
-        lines.append(
-            "\n**Pending Legislation:** Say 'virginia legislation' for active bills"
-        )
-        lines.append(f"\n- Calendar source: {source_note}")
+        lines.append(f"\n- Data source: {source_note}")
         return "\n".join(lines)
 
     # ------------------------------------------------------------------
@@ -390,6 +387,8 @@ class VirginiaStateSource(CivicSource):
             list_url, headers=self._headers(api_key), timeout=REQUEST_TIMEOUT
         )
         if resp.status_code in (401, 403):
+            # bad/missing key — fall back to public feeds instead of hard-failing
+            self._api_key = None
             raise RuntimeError(
                 f"LIS API key rejected (HTTP {resp.status_code}) — verify LIS_API_KEY in Settings"
             )
@@ -412,17 +411,14 @@ class VirginiaStateSource(CivicSource):
         last_error = "no csv found"
         for code in codes_to_try:
             url = BILLS_CSV_TMPL.format(session_code=code)
-            resp = self._http_get(
-                url,
-                headers={"User-Agent": "OpenHome-TownHall/1.0", "Accept": "text/csv"},
-                timeout=REQUEST_TIMEOUT,
-            )
+            resp = self._http_get(url, timeout=REQUEST_TIMEOUT)
             text = resp.text or ""
             if resp.status_code >= 400 or not text or text.lstrip().startswith("<"):
                 last_error = f"HTTP {resp.status_code} for session {code}"
                 continue
             if "Bill_id" not in text[:200]:
-                last_error = f"unexpected csv for session {code}"
+                preview = text[:80].replace("\n", " ")
+                last_error = f"unexpected csv for session {code}: {preview}"
                 continue
             bills = self._parse_bills_csv(text)
             self._session_code = code
@@ -585,21 +581,24 @@ class VirginiaStateSource(CivicSource):
         api_key = self._api_key
         label = ""
         bills: list[dict] = []
-        source_note = "LIS API"
+        source_note = "Virginia bills"
 
         if api_key:
             try:
                 label, bills = self._fetch_bills_via_api(api_key)
+                source_note = "Virginia bills"
             except Exception as e:
-                source_note = f"LIS API unavailable ({e}); using BILLS.CSV"
+                if self._worker:
+                    self._worker.editor_logging_handler.warning(
+                        f"Virginia legislation API: {e}"
+                    )
                 bills = []
 
         if not bills:
             code, guessed_label = self._resolve_session(api_key)
             try:
                 label, bills = self._fetch_bills_via_csv(code, guessed_label or label)
-                if "CSV" not in source_note:
-                    source_note = "BILLS.CSV"
+                source_note = "Virginia bill list"
             except Exception as e:
                 return (
                     "### Virginia General Assembly Legislation\n"
@@ -612,12 +611,13 @@ class VirginiaStateSource(CivicSource):
         lines = [f"### Virginia General Assembly Legislation ({label or 'current session'})"]
         if not selected:
             lines.append("- No matching legislation found for current focus topics.")
-            lines.append(f"- Source: {self.get_source_url()} ({source_note})")
+            lines.append(f"- Data source: {source_note}")
+            lines.append(f"- Source: {self.get_source_url()}")
             return "\n".join(lines)
 
         for bill in selected:
             lines.append(self._format_bill_line(bill))
-        lines.append(f"\n- Legislation source: {source_note}")
+        lines.append(f"\n- Data source: {source_note}")
         return "\n".join(lines)
 
     # ------------------------------------------------------------------

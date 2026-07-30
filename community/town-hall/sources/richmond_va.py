@@ -79,7 +79,7 @@ class RichmondCitySource(CivicSource):
         """minimal url encoding for odata query values (spaces and quotes)."""
         return value.replace("%", "%25").replace("'", "%27").replace(" ", "%20").replace("+", "%2B")
 
-    def _api_get(self, path: str, params: dict = None):
+    async def _api_get(self, path: str, params: dict = None):
         """get json from the legistar web api. returns parsed json (list or dict)."""
         url = f"{LEGISTAR_API_BASE}/{path}"
         if params:
@@ -87,19 +87,19 @@ class RichmondCitySource(CivicSource):
                 f"{key}={self._encode_query_value(str(value))}" for key, value in params.items()
             )
             url = f"{url}?{query}"
-        resp = self._http_get(url, headers={"Accept": "application/json"})
+        resp = await self._http_get(url, headers={"Accept": "application/json"})
         if resp.status_code >= 400:
             raise RuntimeError(f"legistar api HTTP {resp.status_code} for {path}")
         return json.loads(resp.text)
 
-    def _refresh_legislation_cache(self, days_back: int = 60) -> list[dict]:
+    async def _refresh_legislation_cache(self, days_back: int = 60) -> list[dict]:
         """fetch recent ordinances and resolutions from the web api into the cache."""
         since = (datetime.now() - timedelta(days=days_back)).strftime('%Y-%m-%d')
         odata_filter = (
             f"MatterIntroDate ge datetime'{since}' and "
             f"(MatterTypeName eq 'Ordinance' or MatterTypeName eq 'Resolution')"
         )
-        matters = self._api_get("matters", {"$filter": odata_filter, "$top": 100})
+        matters = await self._api_get("matters", {"$filter": odata_filter, "$top": 100})
 
         current_year = datetime.now().year
         legislation = []
@@ -137,9 +137,9 @@ class RichmondCitySource(CivicSource):
         self._recent_legislation = legislation
         return legislation
 
-    def _fetch_agenda_items(self, event_id: str) -> list[dict]:
+    async def _fetch_agenda_items(self, event_id: str) -> list[dict]:
         """fetch agenda items for a meeting from the web api."""
-        raw_items = self._api_get(f"events/{event_id}/eventitems", {"$top": 100})
+        raw_items = await self._api_get(f"events/{event_id}/eventitems", {"$top": 100})
 
         items = []
         for item in raw_items:
@@ -163,12 +163,12 @@ class RichmondCitySource(CivicSource):
     # meetings (legistar web api /events)
     # ------------------------------------------------------------------
 
-    def _fetch_meetings(self, days_back: int = 3, days_ahead: int = 14) -> list[dict]:
+    async def _fetch_meetings(self, days_back: int = 3, days_ahead: int = 14) -> list[dict]:
         """fetch meetings from the web api and normalize into meeting dicts."""
         start = (datetime.now() - timedelta(days=days_back)).strftime('%Y-%m-%d')
         end = (datetime.now() + timedelta(days=days_ahead + 1)).strftime('%Y-%m-%d')
         odata_filter = f"EventDate ge datetime'{start}' and EventDate lt datetime'{end}'"
-        events = self._api_get("events", {"$filter": odata_filter, "$orderby": "EventDate", "$top": 100})
+        events = await self._api_get("events", {"$filter": odata_filter, "$orderby": "EventDate", "$top": 100})
 
         meetings = []
         for event in events:
@@ -282,7 +282,7 @@ class RichmondCitySource(CivicSource):
     async def fetch_updates(self) -> str:
         """fetch upcoming richmond meetings and format for voice."""
         try:
-            meetings = self._fetch_meetings()
+            meetings = await self._fetch_meetings()
 
             # cache for get_details
             self._recent_meetings = meetings
@@ -336,7 +336,7 @@ class RichmondCitySource(CivicSource):
     async def fetch_legislation(self) -> str:
         """fetch and summarize recent legislation from the legistar web api."""
         try:
-            legislation = self._refresh_legislation_cache()
+            legislation = await self._refresh_legislation_cache()
         except Exception as e:
             return f"### Richmond City Legislation\n- Error fetching legislation: {str(e)}"
 
@@ -436,7 +436,7 @@ class RichmondCitySource(CivicSource):
             # make sure the cache is populated
             if not self._recent_legislation:
                 try:
-                    self._refresh_legislation_cache()
+                    await self._refresh_legislation_cache()
                 except Exception:
                     pass
 
@@ -464,7 +464,7 @@ class RichmondCitySource(CivicSource):
         if should_search_legislation:
             if not self._recent_legislation:
                 try:
-                    self._refresh_legislation_cache()
+                    await self._refresh_legislation_cache()
                 except Exception:
                     pass
 
@@ -523,7 +523,7 @@ class RichmondCitySource(CivicSource):
         agenda_items = []
         if meeting.get('id'):
             try:
-                agenda_items = self._fetch_agenda_items(meeting['id'])
+                agenda_items = await self._fetch_agenda_items(meeting['id'])
             except Exception:
                 agenda_items = []
 

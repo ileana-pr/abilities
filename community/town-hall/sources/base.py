@@ -39,43 +39,9 @@ class CivicSource(ABC):
         return an empty tuple to always include this source regardless of trigger."""
         return ()
 
-    @staticmethod
-    def extract_section(content: str, name: str) -> str | None:
-        """return the ### {name} section only (exact heading line, not a prefix)."""
-        if not content or not name:
-            return None
-        heading = f"### {name}"
-        lines = content.splitlines(keepends=True)
-        start = None
-        for i, line in enumerate(lines):
-            if line.strip() == heading:
-                start = i
-                break
-        if start is None:
-            return None
-        end = len(lines)
-        for j in range(start + 1, len(lines)):
-            stripped = lines[j].strip()
-            if stripped == "---" or stripped.startswith("### "):
-                end = j
-                break
-        return "".join(lines[start:end])
-
     def validate_cache(self, content: str) -> bool:
-        """return False if this source's section is missing or contains an error."""
-        section = self.extract_section(content, self.get_name())
-        if not section:
-            return False
-        data_lines = [
-            l.strip() for l in section.split("\n")
-            if l.strip() and not l.strip().startswith("#")
-        ]
-        if not data_lines:
-            return False
-        for line in data_lines:
-            lowered = line.lower()
-            if lowered.startswith("- error") or lowered.startswith("error"):
-                return False
+        """optional source hook for custom cache rules.
+        briefing section parsing lives in main.py (_extract_section)."""
         return True
 
 
@@ -154,6 +120,7 @@ class CivicSource(ABC):
         if (
             not text.strip()
             or text.startswith("coroutine ")
+            or text.startswith("<coroutine")
             or "traceback" in lowered
             or lowered.startswith("error")
             or "failed" in lowered[:100]
@@ -161,19 +128,33 @@ class CivicSource(ABC):
             return _SimpleResponse(text, status_code=502)
         return _SimpleResponse(text, status_code=200)
 
-    def _http_get(self, url: str, headers: dict = None, timeout: float = None):
-        """http get using openhome sdk. timeout is accepted for call-site
-        compatibility but the sdk manages request timeouts itself."""
+    async def _http_get(self, url: str, headers: dict = None, timeout: float = None):
+        """http get using openhome sdk. await if the sdk returns a coroutine."""
         if not self._worker:
             raise RuntimeError("worker not bound - call bind_worker() first")
-        response = self._worker.session_tasks.get(url, headers=headers or {})
+        try:
+            response = self._worker.session_tasks.get(url, headers=headers or {})
+        except Exception as e:
+            raise RuntimeError(f"HTTP GET failed for {url}: {e}") from e
+        # some sdk builds return an awaitable; others return a response object
+        try:
+            response = await response
+        except TypeError:
+            pass
         return self._normalize_response(response)
 
-    def _http_post(self, url: str, headers: dict = None, json_body: dict = None, timeout: float = None):
+    async def _http_post(self, url: str, headers: dict = None, json_body: dict = None, timeout: float = None):
         """http post using openhome sdk."""
         if not self._worker:
             raise RuntimeError("worker not bound - call bind_worker() first")
-        response = self._worker.session_tasks.post(
-            url, headers=headers or {}, json=json_body
-        )
+        try:
+            response = self._worker.session_tasks.post(
+                url, headers=headers or {}, json=json_body
+            )
+        except Exception as e:
+            raise RuntimeError(f"HTTP POST failed for {url}: {e}") from e
+        try:
+            response = await response
+        except TypeError:
+            pass
         return self._normalize_response(response)

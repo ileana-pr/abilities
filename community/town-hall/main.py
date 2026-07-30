@@ -12,6 +12,71 @@ BRIEFING_FILE = "townhall_briefing.md"
 TOPICS_FILE = "topic_preferences.json"
 
 
+def _extract_section(content: str, name: str):
+    """return the ### {name} section only.
+    accepts optional ' (session label)' suffix, but not ' Legislation ...'."""
+    if not content or not name:
+        return None
+    want = " ".join((name or "").split())
+    lines = content.splitlines(keepends=True)
+    start = None
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped.startswith("### "):
+            continue
+        title = " ".join(stripped[4:].split())
+        if title == want:
+            start = i
+            break
+        # ### Virginia General Assembly (2026 Regular Session)
+        if title.startswith(want + " (") and " legislation" not in title.lower():
+            start = i
+            break
+    if start is None:
+        return None
+    end = len(lines)
+    for j in range(start + 1, len(lines)):
+        stripped = lines[j].strip()
+        if stripped == "---" or stripped.startswith("### "):
+            end = j
+            break
+    return "".join(lines[start:end])
+
+
+def _section_is_valid(content: str, name: str) -> bool:
+    """true when the named section exists and has no error lines."""
+    section = _extract_section(content, name)
+    if not section:
+        return False
+    data_lines = [
+        line.strip()
+        for line in section.split("\n")
+        if line.strip() and not line.strip().startswith("#")
+    ]
+    if not data_lines:
+        return False
+    for line in data_lines:
+        lowered = line.lower()
+        if lowered.startswith("- error") or lowered.startswith("error"):
+            return False
+    return True
+
+
+def _briefing_has_explicit_error(text: str) -> bool:
+    for line in (text or "").splitlines():
+        lowered = line.strip().lower()
+        if lowered.startswith("- error") or "error fetching" in lowered:
+            return True
+    return False
+
+
+def _briefing_is_empty_calendar(text: str) -> bool:
+    """true when the briefing is valid but lists no upcoming meetings."""
+    if not (text or "").strip() or _briefing_has_explicit_error(text):
+        return False
+    return "no upcoming" in (text or "").lower()
+
+
 class TownHallCapability(MatchingCapability):
     worker: AgentWorker = None
     capability_worker: CapabilityWorker = None
@@ -37,19 +102,25 @@ class TownHallCapability(MatchingCapability):
 
     async def _load_topic_preferences(self) -> list[str]:
         """load the user's topic preferences (shared across all sources)."""
-        exists = await self.capability_worker.check_if_file_exists(
-            TOPICS_FILE, in_ability_directory=True
-        )
-        if not exists:
-            return []
+        try:
+            exists = await self.capability_worker.check_if_file_exists(
+                TOPICS_FILE, in_ability_directory=True
+            )
+            if not exists:
+                return []
 
-        content = await self.capability_worker.read_file(
-            TOPICS_FILE, in_ability_directory=True
-        )
-        if not content:
-            return []
+            content = await self.capability_worker.read_file(
+                TOPICS_FILE, in_ability_directory=True
+            )
+            if not content:
+                return []
 
-        data = json.loads(content)
+            data = json.loads(content)
+        except Exception as e:
+            self.worker.editor_logging_handler.warning(
+                f"topic preferences load failed: {e}"
+            )
+            return []
 
         # current format: {"topics": ["housing", "zoning"]}
         if isinstance(data, dict) and isinstance(data.get("topics"), list):
@@ -116,36 +187,48 @@ class TownHallCapability(MatchingCapability):
         )
 
     async def write_context_file(self, filename: str, content: str):
-        exists = await self.capability_worker.check_if_file_exists(
-            filename, in_ability_directory=False
-        )
-        if exists:
-            await self.capability_worker.delete_file(filename, in_ability_directory=False)
-        await self.capability_worker.write_file(
-            filename, content, in_ability_directory=False
-        )
+        try:
+            exists = await self.capability_worker.check_if_file_exists(
+                filename, in_ability_directory=False
+            )
+            if exists:
+                await self.capability_worker.delete_file(
+                    filename, in_ability_directory=False
+                )
+            await self.capability_worker.write_file(
+                filename, content, in_ability_directory=False
+            )
+        except Exception as e:
+            self.worker.editor_logging_handler.warning(
+                f"context file write failed for {filename}: {e}"
+            )
 
     async def read_cached_briefing(self, active_sources: list[CivicSource]) -> str | None:
         """return cached sections for active sources only, if all validate."""
-        exists = await self.capability_worker.check_if_file_exists(
-            BRIEFING_FILE, in_ability_directory=False
-        )
-        if not exists:
-            return None
         try:
+            exists = await self.capability_worker.check_if_file_exists(
+                BRIEFING_FILE, in_ability_directory=False
+            )
+            if not exists:
+                return None
             content = await self.capability_worker.read_file(
                 BRIEFING_FILE, in_ability_directory=False
             )
-        except Exception:
+        except Exception as e:
+            self.worker.editor_logging_handler.warning(
+                f"briefing cache read failed: {e}"
+            )
             return None
         if not content:
             return None
-        if not all(source.validate_cache(content) for source in active_sources):
+        if not all(
+            _section_is_valid(content, source.get_name()) for source in active_sources
+        ):
             return None
         # only serve the active source sections — never a sibling source's errors
         sections = []
         for source in active_sources:
-            section = CivicSource.extract_section(content, source.get_name())
+            section = _extract_section(content, source.get_name())
             if section:
                 sections.append(section.strip())
         if not sections:
@@ -158,24 +241,53 @@ class TownHallCapability(MatchingCapability):
         """fetch active sources and refresh the ambient briefing file."""
         await self._bind_sources()
         source_names = ", ".join(s.get_name() for s in active_sources)
-        aggregated = [
+        header = (
             f"# TownHall Civic Briefing\n"
             f"Sources: {source_names}\n"
             f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-        ]
+        )
+        sections = []
         for source in active_sources:
             if announce:
                 await self.capability_worker.speak(f"Checking {source.get_name()}.")
             self.worker.editor_logging_handler.info(f"Polling source: {source.get_name()}")
-            updates = await source.fetch_updates()
+            try:
+                updates = await source.fetch_updates()
+            except Exception as e:
+                self.worker.editor_logging_handler.error(
+                    f"Source {source.get_name()} fetch raised: {e}"
+                )
+                updates = (
+                    f"### {source.get_name()}\n"
+                    f"- Error fetching meetings: {e}\n"
+                    f"- Source: {source.get_source_url()}"
+                )
+            updates = (updates or "").strip()
+            # canonicalize the first heading to the source display name so cache
+            # matching stays stable even if a source adds a session suffix
+            if updates.startswith("### "):
+                rest = updates.split("\n", 1)
+                body = rest[1] if len(rest) > 1 else ""
+                updates = f"### {source.get_name()}" + (f"\n{body}" if body else "")
+            else:
+                updates = f"### {source.get_name()}\n{updates}"
             self.worker.editor_logging_handler.info(
                 f"Source {source.get_name()} returned {len(updates)} chars"
             )
-            aggregated.append(updates)
-        final_context = "\n\n---\n\n".join(aggregated)
-        # only persist when at least one active source returned usable data
-        if any(source.validate_cache(final_context) for source in active_sources):
-            await self.write_context_file(BRIEFING_FILE, final_context)
+            sections.append(updates)
+
+        # header, then source sections separated by --- (sections themselves stay intact)
+        final_context = header + "\n" + "\n\n---\n\n".join(sections)
+        try:
+            if any(
+                _section_is_valid(final_context, source.get_name())
+                for source in active_sources
+            ):
+                await self.write_context_file(BRIEFING_FILE, final_context)
+        except Exception as e:
+            self.worker.editor_logging_handler.warning(
+                f"briefing cache update skipped: {e}"
+            )
         self.worker.editor_logging_handler.info(
             f"Briefing ready ({len(final_context)} chars): {final_context[:400]}"
         )
@@ -206,31 +318,59 @@ class TownHallCapability(MatchingCapability):
         """limit error checks to the active source sections."""
         parts = []
         for source in active_sources:
-            section = CivicSource.extract_section(text, source.get_name())
+            section = _extract_section(text, source.get_name())
             if section:
                 parts.append(section)
         return "\n".join(parts) if parts else (text or "")
+
+    def _briefing_fail_reason(
+        self, text: str, active_sources: list[CivicSource] | None = None
+    ) -> str:
+        """human-readable reason when a briefing cannot be spoken."""
+        snip = self._error_snip(text, active_sources)
+        if snip:
+            return snip
+        if not (text or "").strip():
+            return "Briefing was empty."
+        if not active_sources:
+            return "No civic source matched."
+        found = [
+            line.strip()
+            for line in (text or "").splitlines()
+            if line.strip().startswith("### ")
+        ]
+        missing = []
+        for source in active_sources:
+            name = source.get_name()
+            if not _extract_section(text, name):
+                missing.append(name)
+        if missing:
+            found_note = f" Found headings: {', '.join(found)}." if found else ""
+            return f"Missing section for {', '.join(missing)}.{found_note}"
+        return "Briefing section was empty or invalid."
 
     def _briefing_failed(
         self, text: str, active_sources: list[CivicSource] | None = None
     ) -> bool:
         """true when active source sections are empty or errored."""
-        scoped = (
-            self._active_briefing_text(text, active_sources)
-            if active_sources
-            else (text or "")
-        )
-        if not scoped.strip():
+        if not (text or "").strip():
             return True
-        for line in scoped.splitlines():
-            lowered = line.strip().lower()
-            if lowered.startswith("- error") or lowered.startswith("error"):
+        if _briefing_has_explicit_error(text):
+            # if the error is outside the active source section, still fail safe
+            if not active_sources:
                 return True
-        if active_sources and not all(
-            source.validate_cache(scoped) for source in active_sources
-        ):
-            return True
-        return False
+            for source in active_sources:
+                section = _extract_section(text, source.get_name())
+                if section and _briefing_has_explicit_error(section):
+                    return True
+                if not section:
+                    return True
+            return False
+        if not active_sources:
+            return False
+        return not all(
+            _section_is_valid(text, source.get_name()) for source in active_sources
+        )
 
     def _error_snip(
         self, text: str, active_sources: list[CivicSource] | None = None
@@ -240,10 +380,11 @@ class TownHallCapability(MatchingCapability):
             if active_sources
             else (text or "")
         )
-        for line in scoped.splitlines():
-            lowered = line.strip().lower()
-            if lowered.startswith("- error") or "error fetching" in lowered:
-                return line.strip(" -")[:160]
+        for candidate in (scoped, text or ""):
+            for line in candidate.splitlines():
+                lowered = line.strip().lower()
+                if lowered.startswith("- error") or "error fetching" in lowered:
+                    return line.strip(" -")[:160]
         return ""
 
     def _data_source_label(self, text: str) -> str:
@@ -755,20 +896,40 @@ class TownHallCapability(MatchingCapability):
             self.worker.editor_logging_handler.error(
                 f"TownHall briefing fetch error: {e}"
             )
-            await self.capability_worker.speak(
-                "I couldn't reach the civic sources right now. Try again in a minute."
-            )
+            detail = str(e).strip().replace("\n", " ")[:120]
+            msg = "I couldn't reach the civic sources right now."
+            if detail:
+                msg = f"{msg} {detail}."
+            await self.capability_worker.speak(msg)
             self.capability_worker.resume_normal_flow()
             return
 
         if self._briefing_failed(briefing, active_sources):
-            snip = self._error_snip(briefing, active_sources)
+            reason = self._briefing_fail_reason(briefing, active_sources)
+            self.worker.editor_logging_handler.error(
+                f"TownHall briefing failed: {reason} | preview={(briefing or '')[:400]}"
+            )
             msg = f"I couldn't reach the meetings calendar for {source_names} right now."
-            if snip:
-                msg = f"{msg} {snip}."
+            if reason:
+                msg = f"{msg} {reason}"
             await self.capability_worker.speak(msg)
             for source in active_sources:
                 await self.log_gap(source.get_name(), "Source returned no usable data.")
+            self.capability_worker.resume_normal_flow()
+            return
+
+        # empty calendar is a valid answer — don't invent "unavailable" or offer details
+        if _briefing_is_empty_calendar(
+            self._active_briefing_text(briefing, active_sources)
+        ):
+            label = self._data_source_label(briefing)
+            msg = (
+                f"There are no upcoming meetings on the calendar for "
+                f"{source_names} right now."
+            )
+            if label:
+                msg = f"{msg} Data source: {label}."
+            await self.capability_worker.speak(msg)
             self.capability_worker.resume_normal_flow()
             return
 
@@ -778,9 +939,11 @@ class TownHallCapability(MatchingCapability):
                 f"Using ONLY the briefing text below, summarize the meeting schedule "
                 f"from {source_names} in 3 to 5 short sentences. "
                 "Name committees or bodies and dates/times when present. "
-                "If there are no upcoming meetings, say that clearly. "
-                "If a section contains an error, say the meetings calendar was "
-                "unavailable — do not invent a legislation or bills problem. "
+                "If there are no upcoming meetings, say that clearly — "
+                "do not say the calendar is unavailable. "
+                "Only say the meetings calendar was unavailable when a section "
+                "contains an explicit error line. "
+                "Do not invent a legislation or bills problem. "
                 "Ignore any lines that only tell the listener what to say next. "
                 "Do not mention the data source line — it is added separately. "
                 "Do not mention documents, databases, or missing context. "
@@ -791,7 +954,7 @@ class TownHallCapability(MatchingCapability):
         )
 
         for source in active_sources:
-            if not source.validate_cache(briefing):
+            if not _section_is_valid(briefing, source.get_name()):
                 await self.log_gap(source.get_name(), "Source returned no usable data.")
 
         await self._offer_details_once(

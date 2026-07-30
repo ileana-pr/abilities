@@ -9,7 +9,8 @@ from .base import CivicSource
 LIS_BASE = "https://lis.virginia.gov"
 ICS_URL = "https://liscdn.blob.core.windows.net/cdn/meetings.ics"
 BILLS_CSV_TMPL = "https://lis.blob.core.windows.net/lisfiles/{session_code}/BILLS.CSV"
-SCHEDULE_LIST_URL = f"{LIS_BASE}/Schedule/api/GetPartnerScheduleListAsync"
+# public schedule list (developer keys). partner endpoints need a partner key.
+SCHEDULE_LIST_URL = f"{LIS_BASE}/Schedule/api/GetScheduleListAsync"
 SCHEDULE_BY_ID_URL = f"{LIS_BASE}/Schedule/api/GetPartnerSchedulebyIdAsync"
 TOPIC_QUERIES = ("housing", "education", "zoning")
 MAX_BILLS = 8
@@ -48,6 +49,7 @@ class VirginiaStateSource(CivicSource):
     def _headers(self, api_key: str) -> dict:
         return {
             "WebAPIKey": api_key,
+            "webapikey": api_key,
             "Content-Type": "application/json",
             "Accept": "application/json",
             "User-Agent": "OpenHome-TownHall/1.0",
@@ -58,43 +60,71 @@ class VirginiaStateSource(CivicSource):
     # ------------------------------------------------------------------
 
     def _pick_session(self, sessions: list[dict]) -> tuple[int, str]:
+        """prefer the current (or most recent past) regular session — never a future one."""
         session_code, label = 20261, "2026 Regular Session"
         if not sessions:
             return session_code, label
 
+        now = datetime.now()
+        now_year = now.year
+        # late in the year, the next regular session may already be the default
+        allow_next_year = now.month >= 11
+
         def year_of(s: dict) -> int:
             code = str(s.get("SessionCode") or "0")
-            return int(s.get("SessionYear") or code[:4] or 0)
+            try:
+                return int(s.get("SessionYear") or code[:4] or 0)
+            except (TypeError, ValueError):
+                return 0
 
         def is_regular(s: dict) -> bool:
             stype = str(s.get("SessionType") or "").lower()
             code = str(s.get("SessionCode") or "")
             return stype == "regular" or (code.endswith("1") and "special" not in stype)
 
+        def eligible(s: dict) -> bool:
+            year = year_of(s)
+            if year <= 0:
+                return False
+            if year < now_year:
+                return True
+            if year == now_year:
+                return True
+            if year == now_year + 1 and allow_next_year:
+                return True
+            return False
+
+        pool = [s for s in sessions if eligible(s)] or [
+            s for s in sessions if year_of(s) <= now_year
+        ] or list(sessions)
+
         def rank(s: dict) -> tuple:
+            year = year_of(s)
             return (
                 1 if (s.get("IsActive") and is_regular(s)) else 0,
                 1 if (s.get("IsDefault") and is_regular(s)) else 0,
                 1 if s.get("IsActive") else 0,
                 1 if s.get("IsDefault") else 0,
                 1 if is_regular(s) else 0,
-                year_of(s),
+                # closer to the current year wins; do not prefer far-future sessions
+                -abs(year - now_year),
+                year,
             )
 
-        chosen = max(sessions, key=rank)
+        chosen = max(pool, key=rank)
         code = str(chosen.get("SessionCode") or "20261")
         year = chosen.get("SessionYear") or code[:4]
         stype = chosen.get("SessionType") or "Regular"
         return int(code), f"{year} {stype} Session"
 
-    def _resolve_session(self, api_key: str | None) -> tuple[int, str]:
+    async def _resolve_session(self, api_key: str | None) -> tuple[int, str]:
         if self._session_code and self._session_label:
             return self._session_code, self._session_label
 
         if api_key:
             try:
                 url = f"{LIS_BASE}/Session/api/getsessionlistasync"
-                resp = self._http_get(
+                resp = await self._http_get(
                     url, headers=self._headers(api_key), timeout=REQUEST_TIMEOUT
                 )
                 if resp.status_code < 400 and resp.text:
@@ -156,15 +186,17 @@ class VirginiaStateSource(CivicSource):
 
     @staticmethod
     def _meeting_title(item: dict) -> str:
+        # OwnerName is the body; Description is often location/html on lis
         for key in (
-            "ScheduleDescription",
-            "Description",
-            "MeetingDescription",
-            "Title",
+            "OwnerName",
             "CommitteeName",
             "ScheduleName",
+            "Title",
             "Name",
             "summary",
+            "ScheduleDescription",
+            "MeetingDescription",
+            "Description",
         ):
             val = (item.get(key) or "").strip()
             if val:
@@ -172,23 +204,45 @@ class VirginiaStateSource(CivicSource):
         return "Legislative meeting"
 
     @staticmethod
+    def _apply_time(dt: datetime, time_part) -> datetime:
+        if not time_part or not (dt.hour == 0 and dt.minute == 0 and dt.second == 0):
+            return dt
+        t = str(time_part).strip()
+        for fmt in ("%I:%M %p", "%H:%M:%S", "%H:%M"):
+            try:
+                tm = datetime.strptime(t, fmt)
+                return dt.replace(hour=tm.hour, minute=tm.minute, second=tm.second)
+            except ValueError:
+                continue
+        return dt
+
+    @staticmethod
     def _meeting_when(item: dict) -> datetime | None:
+        dt = None
         for key in (
             "ScheduleDate",
             "MeetingDate",
             "StartDate",
             "StartDateTime",
+            "ScheduleStartDate",
+            "MeetingStartDate",
+            "EventDate",
             "Date",
             "dtstart",
         ):
             dt = VirginiaStateSource._parse_dt(item.get(key))
             if dt:
-                return dt
-        return None
+                break
+        if not dt:
+            return None
+        for key in ("ScheduleTime", "MeetingTime", "StartTime", "Time"):
+            if item.get(key):
+                return VirginiaStateSource._apply_time(dt, item.get(key))
+        return dt
 
     @staticmethod
     def _meeting_id(item: dict) -> str:
-        for key in ("ScheduleId", "ScheduleID", "Id", "ID", "MeetingId", "uid"):
+        for key in ("ScheduleID", "ScheduleId", "Id", "ID", "MeetingId", "uid"):
             val = item.get(key)
             if val is not None and str(val).strip():
                 return str(val).strip()
@@ -210,6 +264,8 @@ class VirginiaStateSource(CivicSource):
         return ""
 
     def _normalize_meeting(self, item: dict) -> dict | None:
+        if item.get("IsCancelled") is True:
+            return None
         when = self._meeting_when(item)
         if not when:
             return None
@@ -234,8 +290,24 @@ class VirginiaStateSource(CivicSource):
         upcoming.sort(key=lambda m: m["when"])
         return upcoming
 
-    def _fetch_meetings_via_api(self, api_key: str) -> list[dict]:
-        resp = self._http_get(
+    def _merge_meetings(self, *groups: list[dict]) -> list[dict]:
+        """dedupe meetings by id/title+when."""
+        merged = []
+        seen = set()
+        for group in groups:
+            for meeting in group or []:
+                key = (
+                    meeting.get("id")
+                    or f"{meeting.get('title')}|{meeting.get('when')}"
+                )
+                if key in seen:
+                    continue
+                seen.add(key)
+                merged.append(meeting)
+        return merged
+
+    async def _fetch_meetings_via_api(self, api_key: str) -> list[dict]:
+        resp = await self._http_get(
             SCHEDULE_LIST_URL,
             headers=self._headers(api_key),
             timeout=REQUEST_TIMEOUT,
@@ -247,7 +319,10 @@ class VirginiaStateSource(CivicSource):
             raise RuntimeError(f"schedule list HTTP {resp.status_code}")
         if not resp.text:
             return []
-        payload = json.loads(resp.text or "{}") or {}
+        try:
+            payload = json.loads(resp.text or "{}") or {}
+        except Exception as e:
+            raise RuntimeError(f"schedule list JSON parse failed: {e}") from e
         items = (
             payload.get("Schedules")
             or payload.get("ScheduleList")
@@ -258,16 +333,24 @@ class VirginiaStateSource(CivicSource):
         if isinstance(payload, list):
             items = payload
         meetings = []
+        skipped = 0
         for item in items:
             if not isinstance(item, dict):
                 continue
             normalized = self._normalize_meeting(item)
             if normalized:
                 meetings.append(normalized)
+            else:
+                skipped += 1
+        if self._worker:
+            self._worker.editor_logging_handler.info(
+                f"Virginia schedule API: {len(items)} raw, "
+                f"{len(meetings)} parsed, {skipped} skipped"
+            )
         return meetings
 
-    def _fetch_meetings_via_ics(self) -> list[dict]:
-        resp = self._http_get(ICS_URL, timeout=REQUEST_TIMEOUT)
+    async def _fetch_meetings_via_ics(self) -> list[dict]:
+        resp = await self._http_get(ICS_URL, timeout=REQUEST_TIMEOUT)
         if resp.status_code >= 400 or not resp.text:
             body = (resp.text or "")[:120].replace("\n", " ")
             raise RuntimeError(
@@ -322,30 +405,59 @@ class VirginiaStateSource(CivicSource):
 
     async def fetch_updates(self) -> str:
         """upcoming ga / committee meetings; legislation is a separate trigger."""
-        meetings: list[dict] = []
+        try:
+            return await self._fetch_updates_inner()
+        except Exception as e:
+            return (
+                "### Virginia General Assembly\n"
+                f"- Error fetching meetings: {e}\n"
+                f"- Source: {self.get_source_url()}"
+            )
+
+    async def _fetch_updates_inner(self) -> str:
+        api_meetings: list[dict] = []
+        ics_meetings: list[dict] = []
         source_note = ""
         api_key = self._api_key
+        api_error = ""
+        ics_error = ""
 
         if api_key:
             try:
-                meetings = self._fetch_meetings_via_api(api_key)
-                source_note = "Virginia schedule"
+                api_meetings = await self._fetch_meetings_via_api(api_key)
+                if api_meetings:
+                    source_note = "Virginia schedule"
             except Exception as e:
+                api_error = str(e)
                 if self._worker:
                     self._worker.editor_logging_handler.warning(
                         f"Virginia schedule API: {e}"
                     )
 
-        if not meetings:
-            try:
-                meetings = self._fetch_meetings_via_ics()
+        try:
+            ics_meetings = await self._fetch_meetings_via_ics()
+            if ics_meetings and not source_note:
                 source_note = "Virginia calendar"
-            except Exception as e:
-                return (
-                    "### Virginia General Assembly\n"
-                    f"- Error fetching meetings: {e}\n"
-                    f"- Source: {self.get_source_url()}"
+        except Exception as e:
+            ics_error = str(e)
+            if self._worker:
+                self._worker.editor_logging_handler.warning(
+                    f"Virginia calendar ICS: {e}"
                 )
+
+        meetings = self._merge_meetings(api_meetings, ics_meetings)
+        if api_meetings and ics_meetings:
+            source_note = "Virginia schedule"
+        elif not source_note:
+            source_note = "Virginia schedule" if api_meetings else "Virginia calendar"
+
+        if not meetings:
+            detail = api_error or ics_error or "both schedule feeds returned no meetings"
+            return (
+                "### Virginia General Assembly\n"
+                f"- Error fetching meetings: {detail}\n"
+                f"- Source: {self.get_source_url()}"
+            )
 
         upcoming = self._filter_upcoming(meetings)
         self._numbered_meetings = {}
@@ -353,7 +465,16 @@ class VirginiaStateSource(CivicSource):
 
         if not upcoming:
             lines.append(
-                f"- No upcoming committee or floor meetings in the next {MEETING_DAYS_AHEAD} days"
+                "- No upcoming committee or floor meetings in the next 6 months"
+            )
+            lines.append(
+                f"- Parsed {len(meetings)} meeting(s) from the feed; none fall in that window"
+            )
+            soonest = min(meetings, key=lambda m: m["when"])["when"]
+            latest = max(meetings, key=lambda m: m["when"])["when"]
+            lines.append(
+                "- Feed coverage: "
+                f"{soonest.strftime('%Y-%m-%d')} to {latest.strftime('%Y-%m-%d')}"
             )
             lines.append(f"- Data source: {source_note}")
             lines.append(f"- Source: {self.get_source_url()}")
@@ -377,13 +498,13 @@ class VirginiaStateSource(CivicSource):
     # legislation — lis api + bills.csv fallback
     # ------------------------------------------------------------------
 
-    def _fetch_bills_via_api(self, api_key: str) -> tuple[str, list[dict]]:
-        code, label = self._resolve_session(api_key)
+    async def _fetch_bills_via_api(self, api_key: str) -> tuple[str, list[dict]]:
+        code, label = await self._resolve_session(api_key)
         list_url = (
             f"{LIS_BASE}/Legislation/api/getlegislationsessionlistasync"
             f"?SessionCode={code}"
         )
-        resp = self._http_get(
+        resp = await self._http_get(
             list_url, headers=self._headers(api_key), timeout=REQUEST_TIMEOUT
         )
         if resp.status_code in (401, 403):
@@ -400,7 +521,7 @@ class VirginiaStateSource(CivicSource):
         bills = payload.get("Legislations") or payload.get("ListItems") or []
         return label, bills
 
-    def _fetch_bills_via_csv(self, session_code: int, label: str) -> tuple[str, list[dict]]:
+    async def _fetch_bills_via_csv(self, session_code: int, label: str) -> tuple[str, list[dict]]:
         codes_to_try = [session_code]
         year = datetime.now().year
         for y in (year, year - 1, year + 1):
@@ -411,7 +532,7 @@ class VirginiaStateSource(CivicSource):
         last_error = "no csv found"
         for code in codes_to_try:
             url = BILLS_CSV_TMPL.format(session_code=code)
-            resp = self._http_get(url, timeout=REQUEST_TIMEOUT)
+            resp = await self._http_get(url, timeout=REQUEST_TIMEOUT)
             text = resp.text or ""
             if resp.status_code >= 400 or not text or text.lstrip().startswith("<"):
                 last_error = f"HTTP {resp.status_code} for session {code}"
@@ -585,7 +706,7 @@ class VirginiaStateSource(CivicSource):
 
         if api_key:
             try:
-                label, bills = self._fetch_bills_via_api(api_key)
+                label, bills = await self._fetch_bills_via_api(api_key)
                 source_note = "Virginia bills"
             except Exception as e:
                 if self._worker:
@@ -595,9 +716,9 @@ class VirginiaStateSource(CivicSource):
                 bills = []
 
         if not bills:
-            code, guessed_label = self._resolve_session(api_key)
+            code, guessed_label = await self._resolve_session(api_key)
             try:
-                label, bills = self._fetch_bills_via_csv(code, guessed_label or label)
+                label, bills = await self._fetch_bills_via_csv(code, guessed_label or label)
                 source_note = "Virginia bill list"
             except Exception as e:
                 return (
@@ -624,22 +745,26 @@ class VirginiaStateSource(CivicSource):
     # details
     # ------------------------------------------------------------------
 
-    def _fetch_schedule_by_id(self, schedule_id: str) -> dict | None:
+    async def _fetch_schedule_by_id(self, schedule_id: str) -> dict | None:
+        """partner-only detail endpoint; developer keys usually get 401 — return none."""
         api_key = self._api_key
         if not api_key or not schedule_id:
             return None
         url = f"{SCHEDULE_BY_ID_URL}?ScheduleId={schedule_id}"
         try:
-            resp = self._http_get(
+            resp = await self._http_get(
                 url, headers=self._headers(api_key), timeout=REQUEST_TIMEOUT
             )
+            # do not clear api_key on 401 here — partner scope differs from list
             if resp.status_code >= 400 or not resp.text:
                 return None
             payload = json.loads(resp.text or "{}") or {}
             schedules = payload.get("Schedules") or []
             if schedules and isinstance(schedules[0], dict):
                 return schedules[0]
-            if isinstance(payload, dict) and payload.get("ScheduleId"):
+            if isinstance(payload, dict) and (
+                payload.get("ScheduleID") or payload.get("ScheduleId")
+            ):
                 return payload
         except Exception:
             return None
@@ -744,7 +869,7 @@ class VirginiaStateSource(CivicSource):
         meeting = self._find_meeting(ref)
         if meeting:
             if meeting.get("id") and self._api_key:
-                remote = self._fetch_schedule_by_id(meeting["id"])
+                remote = await self._fetch_schedule_by_id(meeting["id"])
                 if remote:
                     normalized = self._normalize_meeting(remote) or meeting
                     # prefer richer notes from remote

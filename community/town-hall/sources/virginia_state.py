@@ -37,6 +37,32 @@ class VirginiaStateSource(CivicSource):
     def required_api_key_name(self) -> str:
         return "LIS_API_KEY"
 
+    @staticmethod
+    def _describe_api_key(api_key: str | None) -> str:
+        """safe key diagnostics for logs/spoken errors — never the secret itself."""
+        if not api_key:
+            return "missing"
+        text = str(api_key).strip()
+        parts = text.split("-")
+        # full guid is 36 chars; accept near-misses after strip so ui clipping
+        # is never confused with a truncated secret
+        if len(text) >= 32 and len(parts) >= 4:
+            return f"present ({len(text)} chars)"
+        return (
+            f"suspicious ({len(text)} chars, "
+            f"expected a 36-character GUID from lis.virginia.gov/developers)"
+        )
+
+    def set_api_key(self, api_key) -> None:
+        cleaned = api_key.strip() if isinstance(api_key, str) and api_key.strip() else None
+        if cleaned:
+            cleaned = cleaned.strip('"').strip("'")
+        self._api_key = cleaned
+        if self._worker:
+            self._worker.editor_logging_handler.info(
+                f"Virginia LIS key status: {self._describe_api_key(cleaned)}"
+            )
+
     def trigger_keywords(self) -> tuple[str, ...]:
         return ("virginia",)
 
@@ -47,10 +73,10 @@ class VirginiaStateSource(CivicSource):
         return self._topic_preferences
 
     def _headers(self, api_key: str) -> dict:
+        # lis docs use webapikey; keep both casings. omit content-type on gets.
         return {
-            "WebAPIKey": api_key,
             "webapikey": api_key,
-            "Content-Type": "application/json",
+            "WebAPIKey": api_key,
             "Accept": "application/json",
             "User-Agent": "OpenHome-TownHall/1.0",
         }
@@ -307,22 +333,38 @@ class VirginiaStateSource(CivicSource):
         return merged
 
     async def _fetch_meetings_via_api(self, api_key: str) -> list[dict]:
+        # date window keeps the payload small (~20kb vs ~2mb unfiltered)
+        start = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+        end = (datetime.now() + timedelta(days=180)).strftime("%Y-%m-%d")
+        params = {"StartDate": start, "EndDate": end}
         resp = await self._http_get(
             SCHEDULE_LIST_URL,
             headers=self._headers(api_key),
+            params=params,
             timeout=REQUEST_TIMEOUT,
         )
         if resp.status_code in (401, 403):
+            status = self._describe_api_key(api_key)
             self._api_key = None
-            raise RuntimeError(f"schedule API key rejected (HTTP {resp.status_code})")
+            raise RuntimeError(
+                f"schedule API key rejected (HTTP {resp.status_code}); key status: {status}"
+            )
         if resp.status_code >= 400:
-            raise RuntimeError(f"schedule list HTTP {resp.status_code}")
+            body = (resp.text or "")[:120].replace("\n", " ")
+            raise RuntimeError(
+                f"schedule list HTTP {resp.status_code}: {body}"
+            )
         if not resp.text:
-            return []
+            raise RuntimeError(
+                f"schedule list returned empty body ({start}..{end})"
+            )
         try:
             payload = json.loads(resp.text or "{}") or {}
         except Exception as e:
             raise RuntimeError(f"schedule list JSON parse failed: {e}") from e
+        if isinstance(payload, dict) and payload.get("Success") is False:
+            fail = (payload.get("FailureMessage") or "unknown failure").strip()
+            raise RuntimeError(f"schedule list Success=false: {fail[:160]}")
         items = (
             payload.get("Schedules")
             or payload.get("ScheduleList")
@@ -332,6 +374,18 @@ class VirginiaStateSource(CivicSource):
         )
         if isinstance(payload, list):
             items = payload
+        if (
+            not items
+            and isinstance(payload, dict)
+            and not any(
+                k in payload
+                for k in ("Schedules", "ScheduleList", "ListItems", "Data")
+            )
+        ):
+            raise RuntimeError(
+                "schedule list had unexpected JSON shape "
+                f"(keys={list(payload.keys())[:8]}, bytes={len(resp.text or '')})"
+            )
         meetings = []
         skipped = 0
         for item in items:
@@ -345,7 +399,8 @@ class VirginiaStateSource(CivicSource):
         if self._worker:
             self._worker.editor_logging_handler.info(
                 f"Virginia schedule API: {len(items)} raw, "
-                f"{len(meetings)} parsed, {skipped} skipped"
+                f"{len(meetings)} parsed, {skipped} skipped "
+                f"({start}..{end}, {len(resp.text or '')} bytes)"
             )
         return meetings
 
@@ -396,7 +451,8 @@ class VirginiaStateSource(CivicSource):
 
     def _format_meeting_title(self, index: int, meeting: dict) -> str:
         when = meeting["when"]
-        day = when.strftime("%A, %B ") + str(when.day)
+        # always include year — voice agents otherwise invent the wrong year
+        day = when.strftime("%A, %B ") + str(when.day) + when.strftime(", %Y")
         time_part = when.strftime("%I:%M %p").lstrip("0")
         if when.hour == 0 and when.minute == 0 and when.second == 0:
             # date-only events
@@ -405,12 +461,19 @@ class VirginiaStateSource(CivicSource):
 
     async def fetch_updates(self) -> str:
         """upcoming ga / committee meetings; legislation is a separate trigger."""
+        return await self.fetch_meetings()
+
+    async def fetch_meetings(self) -> str:
+        """upcoming ga / committee meetings only — never bills."""
         try:
             return await self._fetch_updates_inner()
         except Exception as e:
             return (
                 "### Virginia General Assembly\n"
                 f"- Error fetching meetings: {e}\n"
+                f"- Fetch status: key {self._describe_api_key(self._api_key)}; "
+                f"exception during meetings fetch\n"
+                f"- Briefing type: meetings\n"
                 f"- Source: {self.get_source_url()}"
             )
 
@@ -422,18 +485,49 @@ class VirginiaStateSource(CivicSource):
         api_error = ""
         ics_error = ""
 
+        if not api_key:
+            api_error = (
+                "LIS_API_KEY was not returned by get_api_keys. "
+                "In the townhall Ability editor, add/link LIS_API_KEY under "
+                "Behavior → API Keys (provider https://lis.virginia.gov/developers), "
+                "then confirm the value in Settings → Third-Party Keys"
+            )
+            if self._worker:
+                self._worker.editor_logging_handler.warning(api_error)
+        else:
+            key_status = self._describe_api_key(api_key)
+            if key_status.startswith("suspicious"):
+                api_error = (
+                    f"LIS_API_KEY looks {key_status}. "
+                    "Re-paste the full GUID from lis.virginia.gov/developers"
+                )
+                if self._worker:
+                    self._worker.editor_logging_handler.warning(api_error)
+                api_key = None
+                self._api_key = None
+
         if api_key:
             try:
                 api_meetings = await self._fetch_meetings_via_api(api_key)
                 if api_meetings:
                     source_note = "Virginia schedule"
+                elif self._worker:
+                    self._worker.editor_logging_handler.warning(
+                        "Virginia schedule API returned zero parseable meetings"
+                    )
             except Exception as e:
                 api_error = str(e)
+                if "401" in api_error or "403" in api_error or "rejected" in api_error.lower():
+                    api_error = (
+                        f"{api_error}. Key status: {self._describe_api_key(self._api_key)}. "
+                        "Re-paste the full 36-character GUID in Third-Party Keys"
+                    )
                 if self._worker:
                     self._worker.editor_logging_handler.warning(
-                        f"Virginia schedule API: {e}"
+                        f"Virginia schedule API: {api_error}"
                     )
 
+        # ics is a backup only — the public file is often stale
         try:
             ics_meetings = await self._fetch_meetings_via_ics()
             if ics_meetings and not source_note:
@@ -451,11 +545,30 @@ class VirginiaStateSource(CivicSource):
         elif not source_note:
             source_note = "Virginia schedule" if api_meetings else "Virginia calendar"
 
+        status_line = (
+            f"- Fetch status: key {self._describe_api_key(self._api_key or api_key)}; "
+            f"schedule API {len(api_meetings)} meeting(s)"
+            + (f" ({api_error})" if api_error and not api_meetings else "")
+            + f"; calendar ICS {len(ics_meetings)} meeting(s)"
+            + (f" ({ics_error})" if ics_error and not ics_meetings else "")
+        )
+        type_line = "- Briefing type: meetings"
+
         if not meetings:
-            detail = api_error or ics_error or "both schedule feeds returned no meetings"
+            detail = api_error or ics_error
+            if not detail:
+                detail = (
+                    "LIS_API_KEY was not available to the ability"
+                    if not self._api_key
+                    else "both schedule feeds returned no meetings"
+                )
+            key_note = self._describe_api_key(self._api_key or api_key)
             return (
                 "### Virginia General Assembly\n"
                 f"- Error fetching meetings: {detail}\n"
+                f"- LIS key status: {key_note}\n"
+                f"{status_line}\n"
+                f"{type_line}\n"
                 f"- Source: {self.get_source_url()}"
             )
 
@@ -464,6 +577,19 @@ class VirginiaStateSource(CivicSource):
         lines = ["### Virginia General Assembly"]
 
         if not upcoming:
+            # stale ics-only with no near-term meetings is not a real empty calendar
+            if not api_meetings:
+                detail = api_error or (
+                    "LIS schedule API returned no meetings; "
+                    "public calendar has none upcoming"
+                )
+                return (
+                    "### Virginia General Assembly\n"
+                    f"- Error fetching meetings: {detail}\n"
+                    f"{status_line}\n"
+                    f"{type_line}\n"
+                    f"- Source: {self.get_source_url()}"
+                )
             lines.append(
                 "- No upcoming committee or floor meetings in the next 6 months"
             )
@@ -476,6 +602,8 @@ class VirginiaStateSource(CivicSource):
                 "- Feed coverage: "
                 f"{soonest.strftime('%Y-%m-%d')} to {latest.strftime('%Y-%m-%d')}"
             )
+            lines.append(status_line)
+            lines.append(type_line)
             lines.append(f"- Data source: {source_note}")
             lines.append(f"- Source: {self.get_source_url()}")
             return "\n".join(lines)
@@ -491,7 +619,9 @@ class VirginiaStateSource(CivicSource):
         lines.append(
             "\nSay 'details on meeting [number]' or 'tell me about [committee name]'"
         )
-        lines.append(f"\n- Data source: {source_note}")
+        lines.append(f"\n{status_line}")
+        lines.append(type_line)
+        lines.append(f"- Data source: {source_note}")
         return "\n".join(lines)
 
     # ------------------------------------------------------------------
@@ -772,7 +902,7 @@ class VirginiaStateSource(CivicSource):
 
     def _format_meeting_details(self, meeting: dict) -> str:
         when = meeting["when"]
-        day = when.strftime("%A, %B ") + str(when.day)
+        day = when.strftime("%A, %B ") + str(when.day) + when.strftime(", %Y")
         time_part = when.strftime("%I:%M %p").lstrip("0")
         lines = [
             f"### {meeting['title']}",
@@ -841,10 +971,35 @@ class VirginiaStateSource(CivicSource):
             return self._numbered_meetings.get(int(m.group(1)))
 
         needle = text.lower()
+        # strip filler so "science and technology meeting" can match
+        needle = re.sub(
+            r"\b(meeting|meetings|committee|commission|joint|the|a|an)\b",
+            " ",
+            needle,
+        )
+        needle = re.sub(r"\s+", " ", needle).strip()
+        if not needle:
+            return None
+
         for meeting in self._numbered_meetings.values():
-            if needle in meeting["title"].lower():
+            title = meeting["title"].lower()
+            if needle in title or title in needle:
                 return meeting
-        return None
+
+        # token overlap: "science technology" → technology and science commission
+        tokens = [t for t in re.findall(r"[a-z0-9]+", needle) if len(t) > 2]
+        if not tokens:
+            return None
+        best = None
+        best_score = 0
+        for meeting in self._numbered_meetings.values():
+            title = meeting["title"].lower()
+            score = sum(1 for t in tokens if t in title)
+            need = 2 if len(tokens) >= 2 else 1
+            if score >= need and score > best_score:
+                best_score = score
+                best = meeting
+        return best
 
     async def get_details(self, item_ref: str) -> str:
         ref = (item_ref or "").strip()
@@ -888,8 +1043,13 @@ class VirginiaStateSource(CivicSource):
         if bill:
             return self._format_bill_details(bill)
 
+        hints = []
+        for num, meeting in sorted(self._numbered_meetings.items()):
+            hints.append(f"{num}: {meeting['title']}")
+        hint = ""
+        if hints:
+            hint = " Try meeting " + "; or ".join(hints[:5]) + "."
         return (
             f"### Details\n"
-            f"- Could not find a Virginia meeting or bill matching '{ref}'. "
-            f"Try a meeting number from the briefing or a bill like HB 1234."
+            f"- Could not find a Virginia meeting or bill matching '{ref}'.{hint}"
         )

@@ -1,5 +1,13 @@
-from .richmond_va import RichmondCitySource
 from .virginia_state import VirginiaStateSource
+from .richmond_va import RichmondCitySource
+from .seattle_wa import SeattleCitySource
+from .oakland_ca import OaklandCitySource
+from .boston_ma import BostonCitySource
+from .denver_co import DenverCitySource
+from .baltimore_md import BaltimoreCitySource
+from .phoenix_az import PhoenixCitySource
+from .pittsburgh_pa import PittsburghCitySource
+from .sanjose_ca import SanJoseCitySource
 
 
 def discover_sources():
@@ -9,4 +17,12 @@ def discover_sources():
     return [
         VirginiaStateSource(),
         RichmondCitySource(),
+        SeattleCitySource(),
+        OaklandCitySource(),
+        BostonCitySource(),
+        DenverCitySource(),
+        BaltimoreCitySource(),
+        PhoenixCitySource(),
+        PittsburghCitySource(),
+        SanJoseCitySource(),
     ]

@@ -8,8 +8,10 @@ from src.agent.capability_worker import CapabilityWorker
 from .sources import discover_sources
 from .sources.base import CivicSource
 
-BRIEFING_FILE = "townhall_briefing.md"
+BRIEFING_FILE = "townhall_meetings.md"  # meetings only — never legislation
+LEGACY_BRIEFING_FILE = "townhall_briefing.md"  # old shared cache; deleted on fetch
 TOPICS_FILE = "topic_preferences.json"
+TOWNHALL_BUILD = "2026-07-30n"
 
 
 def _extract_section(content: str, name: str):
@@ -25,11 +27,13 @@ def _extract_section(content: str, name: str):
         if not stripped.startswith("### "):
             continue
         title = " ".join(stripped[4:].split())
+        # meetings sections only — skip legislation headings
+        if "legislation" in title.lower():
+            continue
         if title == want:
             start = i
             break
-        # ### Virginia General Assembly (2026 Regular Session)
-        if title.startswith(want + " (") and " legislation" not in title.lower():
+        if title.startswith(want + " ("):
             start = i
             break
     if start is None:
@@ -85,18 +89,45 @@ class TownHallCapability(MatchingCapability):
     #{{register capability}}
 
     def _resolve_api_key(self, key_name: str) -> str | None:
-        try:
-            key = self.capability_worker.get_api_keys(key_name)
-        except Exception as e:
+        # try exact name plus common casing variants
+        names = [key_name]
+        lower = key_name.lower()
+        upper = key_name.upper()
+        if lower not in names:
+            names.append(lower)
+        if upper not in names:
+            names.append(upper)
+
+        last_err = None
+        for name in names:
+            try:
+                key = self.capability_worker.get_api_keys(name)
+            except Exception as e:
+                last_err = e
+                continue
+            if isinstance(key, dict):
+                key = (
+                    key.get(name)
+                    or key.get(key_name)
+                    or key.get("value")
+                    or key.get("api_key")
+                    or key.get("key")
+                )
+            if isinstance(key, str) and key.strip():
+                cleaned = key.strip().strip('"').strip("'")
+                self.worker.editor_logging_handler.info(
+                    f"{key_name} resolved via '{name}' ({len(cleaned)} chars)"
+                )
+                return cleaned
+
+        if last_err:
             self.worker.editor_logging_handler.warning(
-                f"{key_name} lookup raised an error: {e}"
+                f"{key_name} lookup raised an error: {last_err}"
             )
-            return None
-        if key and str(key).strip():
-            self.worker.editor_logging_handler.info(f"{key_name} resolved successfully")
-            return str(key).strip()
         self.worker.editor_logging_handler.warning(
-            f"{key_name} not found. Add a third-party key named '{key_name}' in Settings."
+            f"{key_name} not found via get_api_keys({names}). "
+            "Declare/link this key on the Ability under Behavior → API Keys, "
+            "and set the value in Settings → Third-Party Keys."
         )
         return None
 
@@ -203,8 +234,20 @@ class TownHallCapability(MatchingCapability):
                 f"context file write failed for {filename}: {e}"
             )
 
+    async def _delete_context_file(self, filename: str) -> None:
+        try:
+            exists = await self.capability_worker.check_if_file_exists(
+                filename, in_ability_directory=False
+            )
+            if exists:
+                await self.capability_worker.delete_file(
+                    filename, in_ability_directory=False
+                )
+        except Exception:
+            pass
+
     async def read_cached_briefing(self, active_sources: list[CivicSource]) -> str | None:
-        """return cached sections for active sources only, if all validate."""
+        """return cached meetings sections for active sources only, if all validate."""
         try:
             exists = await self.capability_worker.check_if_file_exists(
                 BRIEFING_FILE, in_ability_directory=False
@@ -225,7 +268,6 @@ class TownHallCapability(MatchingCapability):
             _section_is_valid(content, source.get_name()) for source in active_sources
         ):
             return None
-        # only serve the active source sections — never a sibling source's errors
         sections = []
         for source in active_sources:
             section = _extract_section(content, source.get_name())
@@ -235,16 +277,36 @@ class TownHallCapability(MatchingCapability):
             return None
         return "\n\n---\n\n".join(sections)
 
+    async def _fetch_meetings_from_source(self, source: CivicSource) -> str:
+        """fetch a meetings calendar for this source."""
+        try:
+            try:
+                updates = await source.fetch_meetings()
+            except AttributeError:
+                updates = await source.fetch_updates()
+        except Exception as e:
+            return (
+                f"### {source.get_name()}\n"
+                f"- Error fetching meetings: {e}\n"
+                f"- TownHall build: {TOWNHALL_BUILD}\n"
+                f"- Source: {source.get_source_url()}"
+            )
+        return (updates or "").strip()
+
     async def collect_briefing(
         self, active_sources: list[CivicSource], announce: bool = False
     ) -> str:
-        """fetch active sources and refresh the ambient briefing file."""
+        """live-fetch meetings for active sources (never legislation)."""
         await self._bind_sources()
+        # drop any prior meetings/legislation ambient cache so poison cannot linger
+        await self._delete_context_file(LEGACY_BRIEFING_FILE)
+        await self._delete_context_file(BRIEFING_FILE)
         source_names = ", ".join(s.get_name() for s in active_sources)
         header = (
-            f"# TownHall Civic Briefing\n"
+            f"# TownHall Meetings Briefing\n"
             f"Sources: {source_names}\n"
             f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"Build: {TOWNHALL_BUILD}\n"
         )
         sections = []
         for source in active_sources:
@@ -252,7 +314,7 @@ class TownHallCapability(MatchingCapability):
                 await self.capability_worker.speak(f"Checking {source.get_name()}.")
             self.worker.editor_logging_handler.info(f"Polling source: {source.get_name()}")
             try:
-                updates = await source.fetch_updates()
+                updates = await self._fetch_meetings_from_source(source)
             except Exception as e:
                 self.worker.editor_logging_handler.error(
                     f"Source {source.get_name()} fetch raised: {e}"
@@ -263,12 +325,20 @@ class TownHallCapability(MatchingCapability):
                     f"- Source: {source.get_source_url()}"
                 )
             updates = (updates or "").strip()
-            # canonicalize the first heading to the source display name so cache
-            # matching stays stable even if a source adds a session suffix
+            # canonicalize heading to the source display name
             if updates.startswith("### "):
-                rest = updates.split("\n", 1)
-                body = rest[1] if len(rest) > 1 else ""
-                updates = f"### {source.get_name()}" + (f"\n{body}" if body else "")
+                first, _, rest = updates.partition("\n")
+                title = first[4:].strip()
+                if "legislation" in title.lower():
+                    # never rename a legislation heading into a meetings section
+                    updates = (
+                        f"### {source.get_name()}\n"
+                        f"- Error fetching meetings: got a legislation heading "
+                        f"instead of a meetings calendar (build {TOWNHALL_BUILD}).\n"
+                        f"- Source: {source.get_source_url()}"
+                    )
+                else:
+                    updates = f"### {source.get_name()}" + (f"\n{rest}" if rest else "")
             else:
                 updates = f"### {source.get_name()}\n{updates}"
             self.worker.editor_logging_handler.info(
@@ -276,10 +346,9 @@ class TownHallCapability(MatchingCapability):
             )
             sections.append(updates)
 
-        # header, then source sections separated by --- (sections themselves stay intact)
         final_context = header + "\n" + "\n\n---\n\n".join(sections)
         try:
-            if any(
+            if active_sources and all(
                 _section_is_valid(final_context, source.get_name())
                 for source in active_sources
             ):
@@ -347,6 +416,14 @@ class TownHallCapability(MatchingCapability):
         if missing:
             found_note = f" Found headings: {', '.join(found)}." if found else ""
             return f"Missing section for {', '.join(missing)}.{found_note}"
+        scoped = self._active_briefing_text(text, active_sources)
+        preview = " ".join(
+            line.strip(" -")
+            for line in (scoped or "").splitlines()
+            if line.strip() and not line.strip().startswith("#")
+        )[:160]
+        if preview:
+            return f"Briefing section was empty or invalid. {preview}"
         return "Briefing section was empty or invalid."
 
     def _briefing_failed(
@@ -407,12 +484,93 @@ class TownHallCapability(MatchingCapability):
         if mode == "legislation":
             return (
                 "Want details on a specific item? "
-                "Say the bill or ordinance name, or say no."
+                "Say the bill or ordinance name, or say done."
             )
         return (
             "Would you like details on a meeting? "
-            "Say the meeting number, or say no."
+            "Say the meeting number or name, or say done."
         )
+
+    def _anything_else_prompt(self, mode: str) -> str:
+        if mode == "legislation":
+            return "Anything else? Say another bill or ordinance, or say done."
+        return "Anything else? Say another meeting number or name, or say done."
+
+    def _briefing_has_numbered_meetings(self, text: str) -> bool:
+        """true when the briefing lists numbered meetings to ask about."""
+        if _briefing_is_empty_calendar(text):
+            return False
+        return bool(
+            re.search(r"(?m)^\d+\.\s+", text or "")
+            or re.search(r"\d+\s+upcoming meetings", text or "", flags=re.I)
+        )
+
+    def _spoken_meetings_summary(self, text: str, source_names: str) -> str | None:
+        """build a short spoken summary from numbered meeting lines — no llm."""
+        rows = []
+        for line in (text or "").splitlines():
+            # accept em dash, en dash, or hyphen between title and when
+            m = re.match(
+                r"^\s*(\d+)\.\s+\*\*(.+?)\*\*\s*[—–-]\s*(.+?)\s*$",
+                line,
+            )
+            if not m:
+                m = re.match(
+                    r"^\s*(\d+)\.\s+(.+?)\s*[—–-]\s*(.+?)\s*$",
+                    line,
+                )
+            if not m:
+                continue
+            title = m.group(2).strip().strip("*")
+            when = m.group(3).strip()
+            rows.append(f"{title}, {when}")
+            if len(rows) >= 5:
+                break
+        if not rows:
+            return None
+        if len(rows) == 1:
+            body = rows[0]
+        elif len(rows) == 2:
+            body = f"{rows[0]}; and {rows[1]}"
+        else:
+            body = "; ".join(rows[:-1]) + f"; and {rows[-1]}"
+        return f"Here are upcoming meetings for {source_names}. {body}."
+
+    def _fetch_status_snip(self, text: str) -> str:
+        for line in (text or "").splitlines():
+            if line.strip().lower().startswith("- fetch status:"):
+                return line.strip(" -")
+        return ""
+
+    def _briefing_preview(self, text: str, limit: int = 220) -> str:
+        """compact non-heading lines for spoken diagnostics."""
+        parts = []
+        for line in (text or "").splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            parts.append(stripped.lstrip("- ").strip())
+            if sum(len(p) for p in parts) >= limit:
+                break
+        preview = " ".join(parts)
+        if len(preview) > limit:
+            return preview[: limit - 3].rstrip() + "..."
+        return preview
+
+    def _is_new_briefing_request(self, phrase: str) -> bool:
+        """true when the user is asking for a jurisdiction briefing, not an item."""
+        if not self._match_sources(phrase):
+            return False
+        text = (phrase or "").lower().strip()
+        if re.fullmatch(r"\d+", text):
+            return False
+        if re.fullmatch(r"(meeting|number)\s*\d+", text):
+            return False
+        if re.search(r"\b(ord\.?|res\.?)\s*\d", text):
+            return False
+        if re.search(r"\b([hs]b)\s*\d+\b", text):
+            return False
+        return True
 
     async def _offer_details_once(
         self,
@@ -420,38 +578,55 @@ class TownHallCapability(MatchingCapability):
         mode: str,
         preamble: str | None = None,
     ) -> None:
-        """speak optional preamble + details question in one turn, then listen once."""
+        """briefing + details offer, then keep the mic for a few follow-ups.
+
+        staying inside townhall prevents live web search from hijacking
+        agenda/follow-up questions after we resume_normal_flow.
+        """
         prompt = self._details_prompt(mode)
         spoken = f"{preamble.strip()} {prompt}" if preamble else prompt
         await self.capability_worker.speak(spoken)
 
-        answer = await self.capability_worker.user_response()
-        answer = (answer or "").strip()
-
-        if self._is_done_intent(answer):
-            await self.capability_worker.speak("Okay.")
-            self.capability_worker.resume_normal_flow()
-            return
-
-        if self._is_affirmative(answer):
-            if mode == "legislation":
-                await self.capability_worker.speak(
-                    "Which bill or ordinance? Say the name or number."
-                )
-            else:
-                await self.capability_worker.speak(
-                    "Which meeting number should I look up?"
-                )
+        max_turns = 3
+        for turn in range(max_turns):
             answer = await self.capability_worker.user_response()
             answer = (answer or "").strip()
+
             if self._is_done_intent(answer):
                 await self.capability_worker.speak("Okay.")
                 self.capability_worker.resume_normal_flow()
                 return
 
-        await self._handle_meeting_details(
-            answer, active_sources, end_session=False
-        )
+            # "richmond city council" during a virginia follow-up → new briefing
+            if self._is_new_briefing_request(answer):
+                await self._handle_user_phrase(answer.lower())
+                return
+
+            if self._is_affirmative(answer):
+                if mode == "legislation":
+                    await self.capability_worker.speak(
+                        "Which bill or ordinance? Say the name or number."
+                    )
+                else:
+                    await self.capability_worker.speak(
+                        "Which meeting number or name should I look up?"
+                    )
+                answer = await self.capability_worker.user_response()
+                answer = (answer or "").strip()
+                if self._is_done_intent(answer):
+                    await self.capability_worker.speak("Okay.")
+                    self.capability_worker.resume_normal_flow()
+                    return
+                if self._is_new_briefing_request(answer):
+                    await self._handle_user_phrase(answer.lower())
+                    return
+
+            await self._handle_meeting_details(
+                answer, active_sources, end_session=False
+            )
+            if turn + 1 < max_turns:
+                await self.capability_worker.speak(self._anything_else_prompt(mode))
+
         self.capability_worker.resume_normal_flow()
 
     async def watchdog_loop(self):
@@ -489,6 +664,9 @@ class TownHallCapability(MatchingCapability):
         # keep the prompt short — don't enumerate every source (the list grows over time)
         await self.capability_worker.speak("Which briefing would you like?")
         answer = await self.capability_worker.user_response()
+        if self._is_done_intent(answer):
+            await self.capability_worker.speak("Okay.")
+            return []
         matched = self._match_sources(answer)
         if matched:
             return matched
@@ -666,15 +844,23 @@ class TownHallCapability(MatchingCapability):
         text = (phrase or "").lower().strip()
         if not text:
             return True
+        # "no. thank you" / "i'm done." → "no thank you" / "i'm done"
+        text = re.sub(r"[.!?,;:]+", " ", text)
+        text = re.sub(r"\s+", " ", text).strip()
         done_phrases = (
             "done",
             "i'm done",
             "im done",
+            "i am done",
             "that's all",
             "thats all",
+            "that is all",
             "nothing",
             "no thanks",
             "no thank you",
+            "no thankyou",
+            "thank you",
+            "thanks",
             "stop",
             "bye",
             "goodbye",
@@ -683,8 +869,20 @@ class TownHallCapability(MatchingCapability):
             "no",
             "nope",
             "nah",
+            "all good",
+            "i'm good",
+            "im good",
         )
-        return any(p == text or text.startswith(p + " ") for p in done_phrases) or text in done_phrases
+        if text in done_phrases:
+            return True
+        if any(text.startswith(p + " ") for p in done_phrases):
+            return True
+        # "no thank you very much" / "thanks that's all"
+        if text.startswith("no ") and ("thank" in text or "thanks" in text):
+            return True
+        if text.startswith("thanks") or text.startswith("thank you"):
+            return True
+        return False
 
     def _is_affirmative(self, phrase: str) -> bool:
         text = (phrase or "").lower().strip()
@@ -770,13 +968,14 @@ class TownHallCapability(MatchingCapability):
 
             return self._with_data_source(
                 self.capability_worker.text_to_text_response(
-                    "You are summarizing pending legislation. "
+                    "You are summarizing pending legislation from an official feed. "
                     "Using ONLY the info below, provide a clear spoken summary. "
                     "Mention the total count, lead with any items marked as matching "
                     "the user's topics, then highlight 3-5 interesting items. "
                     "If there are no items, say that clearly. "
                     "Do not invent access problems when the list is simply empty. "
                     "Do not mention the data source line — it is added separately. "
+                    "Do not ask follow-up questions. Do not suggest searching the web. "
                     "Keep it conversational for a smart speaker.\n\n"
                     f"LEGISLATION INFO:\n{leg_info}"
                 ),
@@ -791,6 +990,11 @@ class TownHallCapability(MatchingCapability):
         end_session: bool = True,
     ) -> bool:
         """handle meeting / item detail requests. returns True if handled."""
+        if self._is_done_intent(phrase):
+            await self.capability_worker.speak("Okay.")
+            await self._speak_and_maybe_end(end_session)
+            return True
+
         meeting_ref = None
 
         number_match = re.search(r'(?:meeting|number)\s*(\d+)', phrase)
@@ -804,7 +1008,8 @@ class TownHallCapability(MatchingCapability):
 
         if not meeting_ref:
             cleaned = re.sub(
-                r'(tell me about|details? (?:on|for|about)|meeting|more about|what about|the)\s*',
+                r'(tell me about|details? (?:on|for|about)|is there an agenda|'
+                r'agenda for|meeting|more about|what about|the)\s*',
                 '',
                 phrase,
                 flags=re.IGNORECASE,
@@ -824,15 +1029,29 @@ class TownHallCapability(MatchingCapability):
         for source in active_sources:
             try:
                 details = await source.get_details(meeting_ref)
-
-                summary = self.capability_worker.text_to_text_response(
-                    "You are summarizing a civic meeting agenda or legislation item. "
-                    "Using ONLY the details below, provide a clear spoken summary. "
-                    "Mention the name, date/time when present, and 3-5 key points. "
-                    "Keep it conversational for a smart speaker.\n\n"
-                    f"DETAILS:\n{details}"
-                )
-                await self.capability_worker.speak(summary)
+                lowered = (details or "").lower()
+                if "could not find" in lowered or "not yet implemented" in lowered:
+                    # speak feed errors plainly — llm was inventing other states' agendas
+                    plain = " ".join(
+                        line.strip(" -")
+                        for line in (details or "").splitlines()
+                        if line.strip() and not line.strip().startswith("#")
+                    )
+                    await self.capability_worker.speak(plain or "I couldn't find that item.")
+                else:
+                    summary = self.capability_worker.text_to_text_response(
+                        "You are summarizing a civic meeting agenda or legislation item "
+                        "from an official government feed. "
+                        "Using ONLY the details below, provide a clear spoken summary. "
+                        "Mention the name, full date including year when present, time, "
+                        "location, and any agenda or notes. "
+                        "If agenda or notes are missing, say they are not in the official "
+                        "feed yet — do not invent an agenda or borrow another state's info. "
+                        "Do not ask follow-up questions. Do not suggest searching the web. "
+                        "End after the facts.\n\n"
+                        f"DETAILS:\n{details}"
+                    )
+                    await self.capability_worker.speak(summary)
 
             except Exception as e:
                 self.worker.editor_logging_handler.error(f"Details fetch error: {e}")
@@ -845,10 +1064,15 @@ class TownHallCapability(MatchingCapability):
 
         return True
 
-    async def run(self):
-        phrase = await self._capture_trigger_phrase()
+    async def _handle_user_phrase(self, phrase: str) -> None:
+        """route one user phrase to meetings, legislation, or details."""
+        phrase = (phrase or "").strip().lower()
 
-        # topic config is user-level — trigger words only
+        if self._is_done_intent(phrase) and not self._match_sources(phrase):
+            await self.capability_worker.speak("Okay.")
+            self.capability_worker.resume_normal_flow()
+            return
+
         if 'configure' in phrase or 'set topics' in phrase:
             await self._configure_topics()
             self.capability_worker.resume_normal_flow()
@@ -869,7 +1093,6 @@ class TownHallCapability(MatchingCapability):
             self.capability_worker.resume_normal_flow()
             return
 
-        # legislation list + one combined speak (summary + details offer)
         if self._is_legislation_intent(phrase):
             summary = await self._handle_legislation_request(active_sources)
             if summary:
@@ -880,18 +1103,14 @@ class TownHallCapability(MatchingCapability):
                 self.capability_worker.resume_normal_flow()
             return
 
-        # dedicated item details (meeting number / ord / bill id)
-        if self._is_details_intent(phrase):
+        # only treat as item-details when not a fresh jurisdiction ask
+        if self._is_details_intent(phrase) and not self._is_new_briefing_request(phrase):
             await self._handle_meeting_details(phrase, active_sources, end_session=True)
             return
 
         source_names = ", ".join(s.get_name() for s in active_sources)
         try:
-            briefing = await self.read_cached_briefing(active_sources)
-            if briefing:
-                self.worker.editor_logging_handler.info("Using cached briefing")
-            else:
-                briefing = await self.collect_briefing_with_keepalive(active_sources)
+            briefing = await self.collect_briefing_with_keepalive(active_sources)
         except Exception as e:
             self.worker.editor_logging_handler.error(
                 f"TownHall briefing fetch error: {e}"
@@ -906,60 +1125,73 @@ class TownHallCapability(MatchingCapability):
 
         if self._briefing_failed(briefing, active_sources):
             reason = self._briefing_fail_reason(briefing, active_sources)
+            preview = self._briefing_preview(
+                self._active_briefing_text(briefing, active_sources)
+            )
             self.worker.editor_logging_handler.error(
                 f"TownHall briefing failed: {reason} | preview={(briefing or '')[:400]}"
             )
-            msg = f"I couldn't reach the meetings calendar for {source_names} right now."
+            msg = (
+                f"I couldn't reach the meetings calendar for {source_names} right now. "
+                f"Build {TOWNHALL_BUILD}."
+            )
             if reason:
                 msg = f"{msg} {reason}"
+            if preview and preview not in msg:
+                msg = f"{msg} Preview: {preview}"
             await self.capability_worker.speak(msg)
             for source in active_sources:
                 await self.log_gap(source.get_name(), "Source returned no usable data.")
             self.capability_worker.resume_normal_flow()
             return
 
-        # empty calendar is a valid answer — don't invent "unavailable" or offer details
-        if _briefing_is_empty_calendar(
-            self._active_briefing_text(briefing, active_sources)
-        ):
+        active_text = self._active_briefing_text(briefing, active_sources)
+        if _briefing_is_empty_calendar(active_text):
             label = self._data_source_label(briefing)
+            status = self._fetch_status_snip(active_text)
             msg = (
                 f"There are no upcoming meetings on the calendar for "
                 f"{source_names} right now."
             )
+            if status:
+                msg = f"{msg} {status}."
             if label:
                 msg = f"{msg} Data source: {label}."
             await self.capability_worker.speak(msg)
             self.capability_worker.resume_normal_flow()
             return
 
-        summary = self._with_data_source(
-            self.capability_worker.text_to_text_response(
-                "You are giving a short spoken briefing about upcoming meetings only. "
-                f"Using ONLY the briefing text below, summarize the meeting schedule "
-                f"from {source_names} in 3 to 5 short sentences. "
-                "Name committees or bodies and dates/times when present. "
-                "If there are no upcoming meetings, say that clearly — "
-                "do not say the calendar is unavailable. "
-                "Only say the meetings calendar was unavailable when a section "
-                "contains an explicit error line. "
-                "Do not invent a legislation or bills problem. "
-                "Ignore any lines that only tell the listener what to say next. "
-                "Do not mention the data source line — it is added separately. "
-                "Do not mention documents, databases, or missing context. "
-                "Speak plainly for a smart speaker.\n\n"
-                f"BRIEFING TEXT:\n{briefing}"
-            ),
-            briefing,
-        )
+        spoken = self._spoken_meetings_summary(active_text, source_names)
+        if spoken:
+            summary = self._with_data_source(spoken, briefing)
+            await self._offer_details_once(
+                active_sources, mode="meeting", preamble=summary
+            )
+            return
 
-        for source in active_sources:
-            if not _section_is_valid(briefing, source.get_name()):
-                await self.log_gap(source.get_name(), "Source returned no usable data.")
-
-        await self._offer_details_once(
-            active_sources, mode="meeting", preamble=summary
+        status = self._fetch_status_snip(active_text) or self._error_snip(
+            briefing, active_sources
         )
+        preview = self._briefing_preview(active_text)
+        msg = (
+            f"I couldn't load upcoming meetings for {source_names} right now. "
+            f"Build {TOWNHALL_BUILD}."
+        )
+        if status:
+            msg = f"{msg} {status}."
+        if preview:
+            msg = f"{msg} Preview: {preview}"
+        else:
+            msg = f"{msg} Briefing had no usable meeting lines."
+        self.worker.editor_logging_handler.error(
+            f"TownHall no meetings to speak | preview={(active_text or '')[:500]}"
+        )
+        await self.capability_worker.speak(msg)
+        self.capability_worker.resume_normal_flow()
+
+    async def run(self):
+        phrase = await self._capture_trigger_phrase()
+        await self._handle_user_phrase(phrase)
 
     def call(self, worker: AgentWorker):
         self.worker = worker

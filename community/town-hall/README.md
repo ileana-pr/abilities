@@ -17,6 +17,14 @@ A voice-activated civic briefing ability for OpenHome. Ask your agent what's hap
 | `"richmond city"` | Richmond City Council meetings briefing |
 | `"richmond city council"` | same meetings briefing |
 | `"richmond legislation"` | pending Richmond ordinances and resolutions |
+| `"seattle city"` / `"seattle legislation"` | Seattle City Council (Legistar) |
+| `"oakland city"` / `"oakland legislation"` | Oakland City Council (Legistar) |
+| `"boston city"` / `"boston legislation"` | Boston City Council (Legistar) |
+| `"denver city"` / `"denver legislation"` | Denver City Council (Legistar) |
+| `"baltimore city"` / `"baltimore legislation"` | Baltimore City Council (Legistar) |
+| `"phoenix city"` / `"phoenix legislation"` | Phoenix City Council (Legistar) |
+| `"pittsburgh city"` / `"pittsburgh legislation"` | Pittsburgh City Council (Legistar) |
+| `"san jose city"` / `"san jose legislation"` | San Jose City Council (Legistar) |
 | `"town hall"` | asks which briefing you want, then delivers it |
 | `"configure topics"` | opens interactive topic preference configuration |
 | `"set topics"` | opens interactive topic preference configuration |
@@ -34,13 +42,21 @@ Naming a jurisdiction in the trigger skips straight to that briefing — no conf
 | --- | --- | --- |
 | Virginia General Assembly (LIS) | State | `LIS_API_KEY` preferred; meetings fall back to public ICS, bills to public `BILLS.CSV` |
 | Richmond City Council (Legistar) | City | none |
+| Seattle City Council (Legistar) | City | none |
+| Oakland City Council (Legistar) | City | none |
+| Boston City Council (Legistar) | City | none |
+| Denver City Council (Legistar) | City | none |
+| Baltimore City Council (Legistar) | City | none |
+| Phoenix City Council (Legistar) | City | none |
+| Pittsburgh City Council (Legistar) | City | none |
+| San Jose City Council (Legistar) | City | none |
 
 ### Planned Sources
 
 | Source | Level | Status |
 | --- | --- | --- |
 | U.S. Congress (congress.gov API) | Federal | planned |
-| Richmond, VA (expanded) | City | planned |
+| More Legistar cities (Sacramento, Long Beach, San Antonio, King County, …) | City / County | deferred |
 
 > Want to add your city, county, or state? See [Contributing a Source](#contributing-a-source) below.
 
@@ -231,9 +247,12 @@ community/town-hall/
 ├── main.py                  # ability entry point, watchdog loop, LIS key resolution
 ├── sources/
 │   ├── base.py              # CivicSource abstract base class — start here to contribute
+│   ├── legistar.py          # LegistarCitySource parent for Granicus Legistar cities
 │   ├── __init__.py          # register your source here (discover_sources)
 │   ├── virginia_state.py    # reference: Virginia General Assembly (state legislature)
-│   └── richmond_va.py       # reference: Richmond City Council (Legistar)
+│   ├── richmond_va.py       # Richmond City Council (Legistar)
+│   ├── seattle_wa.py        # …and other thin Legistar city subclasses
+│   └── …
 └── README.md
 ```
 
@@ -310,5 +329,5 @@ We welcome sources for any city, county, state, or federal body. The pattern is 
 ## Developer Notes
 
 - **Adding a federal source** — U.S. Congress data is available via the [congress.gov API](https://api.congress.gov/) (free key). A `FederalCongressSource` following the same pattern is on the roadmap.
-- **Adding more city sources** — Legistar (used for Richmond) powers hundreds of city council sites. A generic `LegistarCitySource` that accepts a city subdomain would cover many U.S. cities at once.
+- **Adding more city sources** — Subclass `LegistarCitySource` in `sources/legistar.py` with a city `client_id` (the subdomain before `.legistar.com`), then register it in `sources/__init__.py`.
 - **Knowledge gaps** — when a source returns no usable data, it is logged to `knowledge_gaps.json` in the ability directory. Review this to see which jurisdictions are failing and prioritize fixes.

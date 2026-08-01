@@ -57,6 +57,10 @@ class CivicSource(ABC):
     async def fetch_updates(self) -> str:
         pass
 
+    async def fetch_meetings(self) -> str:
+        """meetings calendar briefing. sources should override; default uses fetch_updates."""
+        return await self.fetch_updates()
+
     async def search(self, query: str) -> str:
         """search this source for specific items (optional feature)."""
         return f"Live search not yet implemented for {self.get_name()}."
@@ -128,33 +132,102 @@ class CivicSource(ABC):
             return _SimpleResponse(text, status_code=502)
         return _SimpleResponse(text, status_code=200)
 
-    async def _http_get(self, url: str, headers: dict = None, timeout: float = None):
-        """http get using openhome sdk. await if the sdk returns a coroutine."""
-        if not self._worker:
-            raise RuntimeError("worker not bound - call bind_worker() first")
+    async def _session_http_get(self, url: str, headers: dict = None, timeout: float = None, params: dict = None):
+        """call the best available session_tasks get helper for async methods."""
+        st = self._worker.session_tasks
+        headers = headers or {}
+        kwargs = {"headers": headers}
+        if params:
+            kwargs["params"] = params
+        if timeout is not None:
+            kwargs["timeout"] = timeout
+
+        async def _call(method):
+            try:
+                return await method(url, **kwargs)
+            except TypeError:
+                # some builds reject timeout/params — retry with headers only
+                return await method(url, headers=headers)
+
+        if hasattr(st, "get_async"):
+            return await _call(st.get_async)
+        if hasattr(st, "httpx_get_async"):
+            return await _call(st.httpx_get_async)
+        if hasattr(st, "aiohttp_get_async"):
+            resp = await _call(st.aiohttp_get_async)
+            try:
+                text = await resp.text()
+            except TypeError:
+                return resp
+            try:
+                status = int(resp.status)
+            except Exception:
+                try:
+                    status = int(resp.status_code)
+                except Exception:
+                    status = 200
+            return _SimpleResponse(text or "", status_code=status)
+        # last resort: sync get
         try:
-            response = self._worker.session_tasks.get(url, headers=headers or {})
-        except Exception as e:
-            raise RuntimeError(f"HTTP GET failed for {url}: {e}") from e
-        # some sdk builds return an awaitable; others return a response object
+            response = st.get(url, **kwargs)
+        except TypeError:
+            response = st.get(url, headers=headers)
         try:
             response = await response
         except TypeError:
             pass
+        return response
+
+    async def _session_http_post(
+        self, url: str, headers: dict = None, json_body: dict = None, timeout: float = None
+    ):
+        st = self._worker.session_tasks
+        headers = headers or {}
+        kwargs = {"headers": headers, "json": json_body}
+        if timeout is not None:
+            kwargs["timeout"] = timeout
+        if hasattr(st, "post_async"):
+            try:
+                return await st.post_async(url, **kwargs)
+            except TypeError:
+                return await st.post_async(url, headers=headers, json=json_body)
+        if hasattr(st, "httpx_post_async"):
+            try:
+                return await st.httpx_post_async(url, **kwargs)
+            except TypeError:
+                return await st.httpx_post_async(url, headers=headers, json=json_body)
+        try:
+            response = st.post(url, **kwargs)
+        except TypeError:
+            response = st.post(url, headers=headers, json=json_body)
+        try:
+            response = await response
+        except TypeError:
+            pass
+        return response
+
+    async def _http_get(
+        self, url: str, headers: dict = None, timeout: float = None, params: dict = None
+    ):
+        """http get using openhome session_tasks async helpers."""
+        if not self._worker:
+            raise RuntimeError("worker not bound - call bind_worker() first")
+        try:
+            response = await self._session_http_get(
+                url, headers=headers, timeout=timeout, params=params
+            )
+        except Exception as e:
+            raise RuntimeError(f"HTTP GET failed for {url}: {e}") from e
         return self._normalize_response(response)
 
     async def _http_post(self, url: str, headers: dict = None, json_body: dict = None, timeout: float = None):
-        """http post using openhome sdk."""
+        """http post using openhome session_tasks async helpers."""
         if not self._worker:
             raise RuntimeError("worker not bound - call bind_worker() first")
         try:
-            response = self._worker.session_tasks.post(
-                url, headers=headers or {}, json=json_body
+            response = await self._session_http_post(
+                url, headers=headers, json_body=json_body, timeout=timeout
             )
         except Exception as e:
             raise RuntimeError(f"HTTP POST failed for {url}: {e}") from e
-        try:
-            response = await response
-        except TypeError:
-            pass
         return self._normalize_response(response)
